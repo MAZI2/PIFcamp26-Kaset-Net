@@ -1,0 +1,34 @@
+# Network of Tape
+
+## General media/method:
+magnetic tape runs through multiple areas of PIFcamp, with multiple read/write recorders on the tape loop, allowing for distributing and recording sound through multiple spaced out areas.
+
+## Variations:
+
+### Multiple tape loops:
+
+Instead of a single giant loop, we may have multiple tape loops of different lengths that that touch at some point and are able to share information. The connections between two loops, for example, consists of two read/write recorders where, if a recording from loop A was to travel to loop B, the recorder on loop A would record, save to sound to controller, erase the sound from loop A, and write the recording to loop B via the writer head on loop B. This way the recodring travelled from loop A to loop B.
+
+This way we can create a network and a router between different loops. It can route recordings between different loops/paths. Either randomly, or with some protocol like ethernet/IP.
+
+Coupling of different sized loops also creates interesting dynamic between recordings of differently sized windows. For example tilen town can have a 2min loop, while the central area or house can have a 10min loop, where both of them at some point share intormation.
+
+This format allows for different experiments or protocols. For example, content on loops can completely switch at certain times, for example tilen town short loop can switch content with the larger house loop completely, where tilen town loop would then contain the content from house tape, but much more overlapped, and the house loop would have a spaced out recordgin from tilen town. 
+
+Making smaller loops communicate also mitigates the problem of managing or driving a single giant loop.
+
+### (Semi-)Centralized read/write heads:
+
+Read-write heads/units on tape can be controlled via an Arduino or perhaps a Raspberry Pi Pico. We can use an Arduino Nano IOT which has wifi cababilities. A central Raspberry Pi can then host a wifi network and control each of Arduinos. This is good for routing or special processing of the recordings on the tape.
+
+### Light signalling: 
+
+Light can be used to signal/indicate the content on tapes. The read/write units can have a light somehow representing the recording on the passing tape. 
+
+## Robustness notes
+
+- Use of multiple smaller loops is probably more robust than a single giant tape.
+
+- For longer connections, a loop or a two-way connection can be contructed with two winding tapes (like a stretched out casette). At all time there is one tape for each direction, continuously winding. When the tapes are fully wound, they begin winding/rewinding into other direction. This way there is always one tape for each direction. This can also be turned into a loop with some read/write and controller logic. This method may be more robust than driving a very long loop. 
+
+
