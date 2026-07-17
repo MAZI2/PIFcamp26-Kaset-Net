@@ -11,6 +11,7 @@ from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 
 
 SERVICE_TYPE = "_recorder._tcp.local."
+MIN_MOTOR_SPEED = 180
 REQUEST_TIMEOUT = 3.0
 
 
@@ -82,7 +83,7 @@ class RecorderGUI:
         self.selected_url = tk.StringVar()
         self.manual_host = tk.StringVar(value="http://raspberrypi.local:5000")
 
-        self.motor_speed = tk.IntVar(value=180)
+        self.motor_speed = tk.IntVar(value=MIN_MOTOR_SPEED)
         self.erase_freq = tk.IntVar(value=20000)
 
         self.zeroconf = Zeroconf()
@@ -188,7 +189,7 @@ class RecorderGUI:
 
         self.speed_slider = ttk.Scale(
             motor_frame,
-            from_=0,
+            from_=MIN_MOTOR_SPEED,
             to=255,
             orient=tk.HORIZONTAL,
             command=self.on_speed_slider,
@@ -377,7 +378,7 @@ class RecorderGUI:
         self.command(f"/erase/on?freq={freq}")
 
     def on_speed_slider(self, value):
-        speed = int(float(value))
+        speed = max(MIN_MOTOR_SPEED, int(float(value)))
         self.motor_speed.set(speed)
         self.speed_label.config(text=str(speed))
 

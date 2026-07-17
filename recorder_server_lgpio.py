@@ -49,6 +49,8 @@ DEFAULT_ERASE_FREQ_HZ = 20000
 ERASE_DUTY_PERCENT = 45
 
 # Motor PWM.
+MIN_MOTOR_SPEED = 180
+DEFAULT_MOTOR_SPEED = MIN_MOTOR_SPEED
 MOTOR_PWM_FREQ_HZ = 20000
 
 # Web server.
@@ -88,6 +90,15 @@ def debug(msg: str):
 
 def clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def normalize_motor_speed(speed) -> int:
+    speed = int(clamp(int(speed), 0, 255))
+
+    if speed == 0:
+        return 0
+
+    return int(clamp(speed, MIN_MOTOR_SPEED, 255))
 
 
 def enable_level(on: bool) -> int:
@@ -319,6 +330,11 @@ def set_record():
 
     update_amp_mute()
 
+    if state["motor_speed"] == 0:
+        state["motor_speed"] = DEFAULT_MOTOR_SPEED
+
+    apply_motor()
+
 
 def set_play():
     debug("Set mode: PLAY")
@@ -367,7 +383,8 @@ def apply_motor():
         stop_waveform(MOTOR_IN4)
         return
 
-    speed = int(clamp(state["motor_speed"], 0, 255))
+    speed = normalize_motor_speed(state["motor_speed"])
+    state["motor_speed"] = speed
     reverse = bool(state["motor_reverse"])
 
     duty = (speed / 255.0) * 100.0
@@ -486,7 +503,6 @@ def index():
 
     <h3>Motor</h3>
     <p><a href="/motor?speed=0">Motor stop</a></p>
-    <p><a href="/motor?speed=100">Motor speed 100</a></p>
     <p><a href="/motor?speed=180">Motor speed 180</a></p>
     <p><a href="/motor?speed=255">Motor max</a></p>
     <p><a href="/reverse/on">Reverse ON</a></p>
@@ -563,7 +579,7 @@ def route_motor():
     reverse = request.values.get("reverse")
 
     if speed is not None:
-        state["motor_speed"] = int(clamp(int(speed), 0, 255))
+        state["motor_speed"] = normalize_motor_speed(speed)
 
     if reverse is not None:
         state["motor_reverse"] = reverse.lower() in ["1", "true", "yes", "on"]
