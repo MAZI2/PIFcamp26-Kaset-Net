@@ -424,10 +424,10 @@ def apply_motor():
         time.sleep(0.02)
 
     if reverse:
-        stop_waveform(MOTOR_IN3)
+        write(MOTOR_IN3, 0)
         start_pwm(MOTOR_IN4, MOTOR_PWM_FREQ_HZ, duty)
     else:
-        stop_waveform(MOTOR_IN4)
+        write(MOTOR_IN4, 0)
         start_pwm(MOTOR_IN3, MOTOR_PWM_FREQ_HZ, duty)
 
     motor_output_reverse = reverse
