@@ -336,15 +336,19 @@ def set_record():
 
     apply_motor()
 
-    # LED ON
+    debug("Record step: LED ON")
     write(RECORD_LED, 0)
+    apply_motor()
 
-    # Mute amp first
+    debug("Record step: amp muted")
     write(AMP_ON, 0)
     time.sleep(0.1)
+    apply_motor()
 
-    # Inverted CD4053 logic: LOW connects mic/record path
+    debug("Record step: mic/record path connected")
     write(MIC_SW, 0)
+    time.sleep(0.05)
+    apply_motor()
 
     update_amp_mute()
 
@@ -534,12 +538,64 @@ def index():
 
     <h3>Debug</h3>
     <p><a href="/status">Status</a></p>
+    <p><a href="/debug/motor/reapply">Debug motor reapply</a></p>
+    <p><a href="/debug/amp/on">Debug amp ON</a></p>
+    <p><a href="/debug/amp/off">Debug amp OFF</a></p>
+    <p><a href="/debug/mic/play">Debug mic PLAY path</a></p>
+    <p><a href="/debug/mic/record">Debug mic RECORD path</a></p>
     """
 
 
 @app.get("/status")
 def route_status():
     debug("HTTP /status")
+    return jsonify(state)
+
+
+@app.route("/debug/motor/reapply", methods=["GET", "POST"])
+def route_debug_motor_reapply():
+    debug("HTTP /debug/motor/reapply")
+
+    if not state["recorder_enabled"]:
+        set_recorder_power(True)
+        time.sleep(0.2)
+
+    if state["motor_speed"] == 0:
+        state["motor_speed"] = DEFAULT_MOTOR_SPEED
+
+    apply_motor()
+    return jsonify(state)
+
+
+@app.route("/debug/amp/on", methods=["GET", "POST"])
+def route_debug_amp_on():
+    debug("HTTP /debug/amp/on")
+    write(AMP_ON, 1)
+    apply_motor()
+    return jsonify(state)
+
+
+@app.route("/debug/amp/off", methods=["GET", "POST"])
+def route_debug_amp_off():
+    debug("HTTP /debug/amp/off")
+    write(AMP_ON, 0)
+    apply_motor()
+    return jsonify(state)
+
+
+@app.route("/debug/mic/play", methods=["GET", "POST"])
+def route_debug_mic_play():
+    debug("HTTP /debug/mic/play")
+    write(MIC_SW, 1)
+    apply_motor()
+    return jsonify(state)
+
+
+@app.route("/debug/mic/record", methods=["GET", "POST"])
+def route_debug_mic_record():
+    debug("HTTP /debug/mic/record")
+    write(MIC_SW, 0)
+    apply_motor()
     return jsonify(state)
 
 
