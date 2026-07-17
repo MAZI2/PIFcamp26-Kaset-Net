@@ -325,8 +325,35 @@ def set_recorder_power(on: bool):
         write(RECORD_LED, 1)
 
 
-def set_record(mute_amp=True, connect_mic=True):
-    debug(f"Set mode: RECORD mute_amp={mute_amp} connect_mic={connect_mic}")
+def ensure_motor_for_record():
+    speed = normalize_motor_speed(state["motor_speed"])
+
+    if speed == 0:
+        debug(f"Record mode starting motor at {DEFAULT_MOTOR_SPEED}")
+        state["motor_speed"] = DEFAULT_MOTOR_SPEED
+        apply_motor()
+        return
+
+    state["motor_speed"] = speed
+
+    if motor_output_reverse is None:
+        debug("Record mode motor state unknown; applying motor")
+        apply_motor()
+        return
+
+    if motor_output_reverse != bool(state["motor_reverse"]):
+        debug("Record mode motor direction changed; applying motor")
+        apply_motor()
+        return
+
+    debug(f"Record mode preserving running motor at speed {speed}")
+
+
+def set_record(mute_amp=True, connect_mic=True, record_led=True):
+    debug(
+        f"Set mode: RECORD mute_amp={mute_amp} "
+        f"connect_mic={connect_mic} record_led={record_led}"
+    )
 
     if not state["recorder_enabled"]:
         set_recorder_power(True)
@@ -334,17 +361,16 @@ def set_record(mute_amp=True, connect_mic=True):
 
     state["mode"] = "record"
 
-    apply_motor()
-
-    debug("Record step: LED ON")
-    write(RECORD_LED, 0)
-    apply_motor()
+    if record_led:
+        debug("Record step: LED ON")
+        write(RECORD_LED, 0)
+    else:
+        debug("Record step: LED left unchanged")
 
     if mute_amp:
         debug("Record step: amp muted")
         write(AMP_ON, 0)
         time.sleep(0.1)
-        apply_motor()
     else:
         debug("Record step: amp left unchanged")
 
@@ -352,7 +378,6 @@ def set_record(mute_amp=True, connect_mic=True):
         debug("Record step: mic/record path connected")
         write(MIC_SW, 0)
         time.sleep(0.05)
-        apply_motor()
     else:
         debug("Record step: mic/record path left unchanged")
 
@@ -361,7 +386,7 @@ def set_record(mute_amp=True, connect_mic=True):
     else:
         debug("Record step: automatic amp mute skipped")
 
-    apply_motor()
+    ensure_motor_for_record()
 
 
 def set_play():
@@ -531,6 +556,7 @@ def index():
     <p><a href="/record">Record</a></p>
     <p><a href="/record?mute=0">Record without amp mute</a></p>
     <p><a href="/record?mic=0">Record without mic switch</a></p>
+    <p><a href="/record?mute=0&mic=0&led=0">Record logic only</a></p>
 
     <h3>Erase</h3>
     <p><a href="/erase/on">Erase ON default</a></p>
@@ -554,6 +580,8 @@ def index():
     <p><a href="/debug/amp/off">Debug amp OFF</a></p>
     <p><a href="/debug/mic/play">Debug mic PLAY path</a></p>
     <p><a href="/debug/mic/record">Debug mic RECORD path</a></p>
+    <p><a href="/debug/led/on">Debug record LED ON</a></p>
+    <p><a href="/debug/led/off">Debug record LED OFF</a></p>
     """
 
 
@@ -610,6 +638,22 @@ def route_debug_mic_record():
     return jsonify(state)
 
 
+@app.route("/debug/led/on", methods=["GET", "POST"])
+def route_debug_led_on():
+    debug("HTTP /debug/led/on")
+    write(RECORD_LED, 0)
+    apply_motor()
+    return jsonify(state)
+
+
+@app.route("/debug/led/off", methods=["GET", "POST"])
+def route_debug_led_off():
+    debug("HTTP /debug/led/off")
+    write(RECORD_LED, 1)
+    apply_motor()
+    return jsonify(state)
+
+
 @app.route("/power/on", methods=["GET", "POST"])
 def route_power_on():
     debug("HTTP /power/on")
@@ -638,7 +682,8 @@ def route_record():
     debug("HTTP /record")
     mute = request.values.get("mute", "1").lower() not in ["0", "false", "no", "off"]
     mic = request.values.get("mic", "1").lower() not in ["0", "false", "no", "off"]
-    set_record(mute_amp=mute, connect_mic=mic)
+    led = request.values.get("led", "1").lower() not in ["0", "false", "no", "off"]
+    set_record(mute_amp=mute, connect_mic=mic, record_led=led)
     return jsonify(state)
 
 
