@@ -325,8 +325,8 @@ def set_recorder_power(on: bool):
         write(RECORD_LED, 1)
 
 
-def set_record():
-    debug("Set mode: RECORD")
+def set_record(mute_amp=True, connect_mic=True):
+    debug(f"Set mode: RECORD mute_amp={mute_amp} connect_mic={connect_mic}")
 
     if not state["recorder_enabled"]:
         set_recorder_power(True)
@@ -340,17 +340,26 @@ def set_record():
     write(RECORD_LED, 0)
     apply_motor()
 
-    debug("Record step: amp muted")
-    write(AMP_ON, 0)
-    time.sleep(0.1)
-    apply_motor()
+    if mute_amp:
+        debug("Record step: amp muted")
+        write(AMP_ON, 0)
+        time.sleep(0.1)
+        apply_motor()
+    else:
+        debug("Record step: amp left unchanged")
 
-    debug("Record step: mic/record path connected")
-    write(MIC_SW, 0)
-    time.sleep(0.05)
-    apply_motor()
+    if connect_mic:
+        debug("Record step: mic/record path connected")
+        write(MIC_SW, 0)
+        time.sleep(0.05)
+        apply_motor()
+    else:
+        debug("Record step: mic/record path left unchanged")
 
-    update_amp_mute()
+    if mute_amp:
+        update_amp_mute()
+    else:
+        debug("Record step: automatic amp mute skipped")
 
     apply_motor()
 
@@ -520,6 +529,8 @@ def index():
     <h3>Mode</h3>
     <p><a href="/play">Play</a></p>
     <p><a href="/record">Record</a></p>
+    <p><a href="/record?mute=0">Record without amp mute</a></p>
+    <p><a href="/record?mic=0">Record without mic switch</a></p>
 
     <h3>Erase</h3>
     <p><a href="/erase/on">Erase ON default</a></p>
@@ -625,7 +636,9 @@ def route_play():
 @app.route("/record", methods=["GET", "POST"])
 def route_record():
     debug("HTTP /record")
-    set_record()
+    mute = request.values.get("mute", "1").lower() not in ["0", "false", "no", "off"]
+    mic = request.values.get("mic", "1").lower() not in ["0", "false", "no", "off"]
+    set_record(mute_amp=mute, connect_mic=mic)
     return jsonify(state)
 
 
