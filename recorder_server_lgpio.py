@@ -69,6 +69,7 @@ app = Flask(__name__)
 h = None
 zeroconf = None
 service_info = None
+motor_output_reverse = None
 
 state = {
     "recorder_enabled": False,
@@ -390,11 +391,14 @@ def erase_off():
 
 
 def apply_motor():
+    global motor_output_reverse
+
     if not state["recorder_enabled"]:
         debug("Motor OFF: recorder disabled")
 
         stop_waveform(MOTOR_IN3)
         stop_waveform(MOTOR_IN4)
+        motor_output_reverse = None
         return
 
     speed = effective_motor_speed()
@@ -407,19 +411,26 @@ def apply_motor():
         f"reverse={reverse}"
     )
 
-    # Stop both before changing direction.
-    stop_waveform(MOTOR_IN3)
-    stop_waveform(MOTOR_IN4)
-
     if speed == 0:
+        stop_waveform(MOTOR_IN3)
+        stop_waveform(MOTOR_IN4)
+        motor_output_reverse = None
         return
 
+    if motor_output_reverse is not None and motor_output_reverse != reverse:
+        debug("Motor direction changed; stopping both sides before reversing")
+        stop_waveform(MOTOR_IN3)
+        stop_waveform(MOTOR_IN4)
+        time.sleep(0.02)
+
     if reverse:
-        write(MOTOR_IN3, 0)
+        stop_waveform(MOTOR_IN3)
         start_pwm(MOTOR_IN4, MOTOR_PWM_FREQ_HZ, duty)
     else:
-        write(MOTOR_IN4, 0)
+        stop_waveform(MOTOR_IN4)
         start_pwm(MOTOR_IN3, MOTOR_PWM_FREQ_HZ, duty)
+
+    motor_output_reverse = reverse
 
 
 # ============================================================
