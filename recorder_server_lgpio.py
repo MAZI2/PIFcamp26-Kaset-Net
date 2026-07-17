@@ -115,6 +115,43 @@ def write(pin: int, level: int):
     lgpio.gpio_write(h, pin, 1 if level else 0)
 
 
+def stop_waveform(pin: int):
+    try:
+        lgpio.tx_pulse(h, pin, 0, 0)
+    except Exception as e:
+        debug(f"PWM stop on GPIO {pin} ignored: {e}")
+
+    write(pin, 0)
+
+
+def start_pwm(pin: int, freq_hz, duty_percent, offset_us=0):
+    freq_hz = float(freq_hz)
+    duty_percent = float(clamp(duty_percent, 0, 100))
+
+    if freq_hz <= 0 or duty_percent <= 0:
+        stop_waveform(pin)
+        return
+
+    if duty_percent >= 100:
+        stop_waveform(pin)
+        write(pin, 1)
+        return
+
+    period_us = max(2, round(1_000_000.0 / freq_hz))
+    pulse_on_us = round(period_us * (duty_percent / 100.0))
+    pulse_on_us = int(clamp(pulse_on_us, 1, period_us - 1))
+    pulse_off_us = period_us - pulse_on_us
+
+    lgpio.tx_pulse(
+        h,
+        pin,
+        pulse_on_us,
+        pulse_off_us,
+        int(max(0, offset_us)),
+        0,
+    )
+
+
 def claim_outputs():
     pins = [
         RECORDER_EN,
@@ -200,14 +237,8 @@ def unregister_mdns_service():
 def stop_erase_outputs():
     debug("Erase outputs OFF")
 
-    try:
-        lgpio.tx_pwm(h, ERASE_IN1, 0, 0)
-        lgpio.tx_pwm(h, ERASE_IN2, 0, 0)
-    except Exception:
-        pass
-
-    write(ERASE_IN1, 0)
-    write(ERASE_IN2, 0)
+    stop_waveform(ERASE_IN1)
+    stop_waveform(ERASE_IN2)
 
 
 def start_erase_outputs(freq_hz=None):
@@ -230,8 +261,8 @@ def start_erase_outputs(freq_hz=None):
     # Opposite-phase PWM:
     # IN1 starts at phase 0.
     # IN2 starts half a period later.
-    lgpio.tx_pwm(h, ERASE_IN1, freq_hz, ERASE_DUTY_PERCENT, 0)
-    lgpio.tx_pwm(h, ERASE_IN2, freq_hz, ERASE_DUTY_PERCENT, half_period_us)
+    start_pwm(ERASE_IN1, freq_hz, ERASE_DUTY_PERCENT, 0)
+    start_pwm(ERASE_IN2, freq_hz, ERASE_DUTY_PERCENT, half_period_us)
 
 
 def update_amp_mute():
@@ -332,10 +363,8 @@ def apply_motor():
     if not state["recorder_enabled"]:
         debug("Motor OFF: recorder disabled")
 
-        lgpio.tx_pwm(h, MOTOR_IN3, 0, 0)
-        lgpio.tx_pwm(h, MOTOR_IN4, 0, 0)
-        write(MOTOR_IN3, 0)
-        write(MOTOR_IN4, 0)
+        stop_waveform(MOTOR_IN3)
+        stop_waveform(MOTOR_IN4)
         return
 
     speed = int(clamp(state["motor_speed"], 0, 255))
@@ -349,20 +378,18 @@ def apply_motor():
     )
 
     # Stop both before changing direction.
-    lgpio.tx_pwm(h, MOTOR_IN3, 0, 0)
-    lgpio.tx_pwm(h, MOTOR_IN4, 0, 0)
-    write(MOTOR_IN3, 0)
-    write(MOTOR_IN4, 0)
+    stop_waveform(MOTOR_IN3)
+    stop_waveform(MOTOR_IN4)
 
     if speed == 0:
         return
 
     if reverse:
         write(MOTOR_IN3, 0)
-        lgpio.tx_pwm(h, MOTOR_IN4, MOTOR_PWM_FREQ_HZ, duty)
+        start_pwm(MOTOR_IN4, MOTOR_PWM_FREQ_HZ, duty)
     else:
         write(MOTOR_IN4, 0)
-        lgpio.tx_pwm(h, MOTOR_IN3, MOTOR_PWM_FREQ_HZ, duty)
+        start_pwm(MOTOR_IN3, MOTOR_PWM_FREQ_HZ, duty)
 
 
 # ============================================================
@@ -383,10 +410,8 @@ def setup():
     write(MIC_SW, 1)
     write(RECORD_LED, 1)
 
-    lgpio.tx_pwm(h, MOTOR_IN3, 0, 0)
-    lgpio.tx_pwm(h, MOTOR_IN4, 0, 0)
-    write(MOTOR_IN3, 0)
-    write(MOTOR_IN4, 0)
+    stop_waveform(MOTOR_IN3)
+    stop_waveform(MOTOR_IN4)
 
     set_recorder_power(True)
     time.sleep(0.2)
