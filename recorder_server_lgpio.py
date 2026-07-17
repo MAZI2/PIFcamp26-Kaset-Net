@@ -101,6 +101,21 @@ def normalize_motor_speed(speed) -> int:
     return int(clamp(speed, MIN_MOTOR_SPEED, 255))
 
 
+def effective_motor_speed() -> int:
+    speed = normalize_motor_speed(state["motor_speed"])
+
+    if (
+        state["recorder_enabled"]
+        and state["mode"] == "record"
+        and speed == 0
+    ):
+        debug(f"Record mode requires motor; forcing speed {DEFAULT_MOTOR_SPEED}")
+        speed = DEFAULT_MOTOR_SPEED
+
+    state["motor_speed"] = speed
+    return speed
+
+
 def enable_level(on: bool) -> int:
     if RECORDER_ENABLE_ACTIVE_HIGH:
         return 1 if on else 0
@@ -318,6 +333,8 @@ def set_record():
 
     state["mode"] = "record"
 
+    apply_motor()
+
     # LED ON
     write(RECORD_LED, 0)
 
@@ -329,9 +346,6 @@ def set_record():
     write(MIC_SW, 0)
 
     update_amp_mute()
-
-    if state["motor_speed"] == 0:
-        state["motor_speed"] = DEFAULT_MOTOR_SPEED
 
     apply_motor()
 
@@ -383,8 +397,7 @@ def apply_motor():
         stop_waveform(MOTOR_IN4)
         return
 
-    speed = normalize_motor_speed(state["motor_speed"])
-    state["motor_speed"] = speed
+    speed = effective_motor_speed()
     reverse = bool(state["motor_reverse"])
 
     duty = (speed / 255.0) * 100.0
