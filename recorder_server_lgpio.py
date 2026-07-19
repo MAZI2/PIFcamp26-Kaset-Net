@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
 import atexit
+import re
+import shutil
 import socket
+import subprocess
 import time
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request, stream_with_context
 from zeroconf import ServiceInfo, Zeroconf
 import lgpio
 
@@ -59,6 +62,15 @@ HTTP_PORT = 5000
 # mDNS/Bonjour service type.
 SERVICE_TYPE = "_recorder._tcp.local."
 
+# USB sound-card monitor stream.
+AUDIO_DEVICE = "default"
+AUDIO_RATE = 44100
+AUDIO_CHANNELS = 1
+AUDIO_FORMAT = "S16_LE"
+DEFAULT_AUDIO_SECONDS = 5.0
+MAX_AUDIO_SECONDS = 60.0
+AUDIO_CAPTURE_TIMEOUT_EXTRA = 10.0
+
 
 # ============================================================
 # GLOBAL STATE
@@ -91,6 +103,13 @@ def debug(msg: str):
 
 def clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def parse_bool(value, default=True):
+    if value is None:
+        return default
+
+    return str(value).lower() not in ["0", "false", "no", "off"]
 
 
 def normalize_motor_speed(speed) -> int:
@@ -194,6 +213,159 @@ def claim_outputs():
     for pin in pins:
         lgpio.gpio_claim_output(h, pin, 0)
         debug(f"Claimed GPIO {pin} as output")
+
+
+# ============================================================
+# AUDIO CAPTURE / STREAMING
+# ============================================================
+
+def find_arecord():
+    return shutil.which("arecord")
+
+
+def parse_alsa_capture_devices(arecord_output):
+    card_pattern = re.compile(r"^card\s+(\d+):\s+([^\[]+).*device\s+(\d+):\s+([^\[]+)")
+    devices = []
+
+    if not arecord_output:
+        return devices
+
+    for line in arecord_output.splitlines():
+        match = card_pattern.search(line)
+
+        if not match:
+            continue
+
+        card, card_name, device, device_name = match.groups()
+        device_id = f"plughw:{card},{device}"
+        label = f"{card_name.strip()} / {device_name.strip()}"
+        devices.append({"id": device_id, "name": label})
+
+    return devices
+
+
+def list_alsa_inputs():
+    arecord = find_arecord()
+
+    if not arecord:
+        raise RuntimeError("arecord not found. Install alsa-utils on the Raspberry Pi.")
+
+    devices = [
+        {"id": "default", "name": "ALSA default input"},
+        {"id": "auto", "name": "Auto-detect first ALSA capture input"},
+    ]
+
+    list_pcms = subprocess.run(
+        [arecord, "-L"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    if list_pcms.stdout:
+        for line in list_pcms.stdout.splitlines():
+            if not line or line[0].isspace():
+                continue
+
+            pcm_name = line.strip()
+
+            if pcm_name and pcm_name != "null":
+                devices.append({"id": pcm_name, "name": pcm_name})
+
+    list_cards = subprocess.run(
+        [arecord, "-l"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    for capture_device in parse_alsa_capture_devices(list_cards.stdout):
+        if not any(existing["id"] == capture_device["id"] for existing in devices):
+            devices.append(capture_device)
+
+    return {
+        "backend": "alsa",
+        "default_input": AUDIO_DEVICE,
+        "inputs": devices,
+        "arecord_l": list_cards.stdout.strip(),
+        "arecord_L": list_pcms.stdout.strip(),
+    }
+
+
+def choose_alsa_capture_device(device=None):
+    if device and device not in ["auto"]:
+        return device
+
+    arecord = find_arecord()
+
+    if not arecord:
+        raise RuntimeError("arecord not found. Install alsa-utils on the Raspberry Pi.")
+
+    result = subprocess.run(
+        [arecord, "-l"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    devices = parse_alsa_capture_devices(result.stdout)
+
+    if devices:
+        chosen = devices[0]["id"]
+        debug(f"ALSA auto-selected capture input: {chosen} ({devices[0]['name']})")
+        return chosen
+
+    debug("No hardware ALSA capture input found; falling back to ALSA default")
+    return AUDIO_DEVICE
+
+
+def record_audio_wav_with_arecord(seconds, samplerate, channels, device=None):
+    arecord = find_arecord()
+
+    if not arecord:
+        raise RuntimeError("arecord not found. Install alsa-utils on the Raspberry Pi.")
+
+    seconds = float(clamp(float(seconds), 0.1, MAX_AUDIO_SECONDS))
+    samplerate = int(clamp(int(samplerate), 8000, 96000))
+    channels = int(clamp(int(channels), 1, 2))
+    total_frames = int(seconds * samplerate)
+    device = choose_alsa_capture_device(device or AUDIO_DEVICE)
+
+    command = [
+        arecord,
+        "-q",
+        "-D",
+        device,
+        "-f",
+        AUDIO_FORMAT,
+        "-r",
+        str(samplerate),
+        "-c",
+        str(channels),
+        "--samples",
+        str(total_frames),
+        "-t",
+        "wav",
+    ]
+
+    debug(f"ALSA capture start: {' '.join(command)}")
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        timeout=seconds + AUDIO_CAPTURE_TIMEOUT_EXTRA,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"arecord failed with exit {result.returncode}: {stderr}")
+
+    debug(f"ALSA capture complete: bytes={len(result.stdout)}")
+    return result.stdout
 
 
 # ============================================================
@@ -591,6 +763,122 @@ def route_status():
     return jsonify(state)
 
 
+@app.route("/audio/devices", methods=["GET"])
+def route_audio_devices():
+    debug("HTTP /audio/devices")
+
+    try:
+        return jsonify(list_alsa_inputs())
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+            "default_device": AUDIO_DEVICE,
+        }), 500
+
+
+@app.route("/audio/stream", methods=["GET"])
+def route_audio_stream():
+    if not find_arecord():
+        return jsonify({
+            "ok": False,
+            "error": "arecord not found. Install alsa-utils on the Raspberry Pi.",
+        }), 500
+
+    try:
+        device = choose_alsa_capture_device(request.values.get("device", AUDIO_DEVICE))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    rate = int(request.values.get("rate", AUDIO_RATE))
+    channels = int(request.values.get("channels", AUDIO_CHANNELS))
+
+    rate = int(clamp(rate, 8000, 96000))
+    channels = int(clamp(channels, 1, 2))
+
+    debug(
+        f"HTTP /audio/stream device={device} "
+        f"rate={rate} channels={channels}"
+    )
+
+    cmd = [
+        "arecord",
+        "-q",
+        "-D", device,
+        "-f", AUDIO_FORMAT,
+        "-r", str(rate),
+        "-c", str(channels),
+        "-t", "wav",
+    ]
+
+    def generate():
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+
+        debug(f"Audio stream started with PID {proc.pid}")
+
+        try:
+            while True:
+                chunk = proc.stdout.read(4096)
+
+                if not chunk:
+                    break
+
+                yield chunk
+
+        except GeneratorExit:
+            debug("Audio stream client disconnected")
+
+        finally:
+            proc.terminate()
+
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+            debug("Audio stream stopped")
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="audio/wav",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.route("/audio/record", methods=["GET"])
+def route_audio_record():
+    debug("HTTP /audio/record")
+
+    try:
+        seconds = request.values.get("seconds", DEFAULT_AUDIO_SECONDS)
+        samplerate = request.values.get("samplerate", AUDIO_RATE)
+        channels = request.values.get("channels", AUDIO_CHANNELS)
+        device = request.values.get("device", AUDIO_DEVICE)
+
+        wav_bytes = record_audio_wav_with_arecord(seconds, samplerate, channels, device)
+
+        return Response(
+            wav_bytes,
+            mimetype="audio/wav",
+            headers={
+                "Content-Disposition": "attachment; filename=recorder_capture.wav",
+            },
+        )
+
+    except Exception as e:
+        debug(f"Audio capture error: {type(e).__name__}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/debug/motor/reapply", methods=["GET", "POST"])
 def route_debug_motor_reapply():
     debug("HTTP /debug/motor/reapply")
@@ -680,9 +968,9 @@ def route_play():
 @app.route("/record", methods=["GET", "POST"])
 def route_record():
     debug("HTTP /record")
-    mute = request.values.get("mute", "1").lower() not in ["0", "false", "no", "off"]
-    mic = request.values.get("mic", "1").lower() not in ["0", "false", "no", "off"]
-    led = request.values.get("led", "1").lower() not in ["0", "false", "no", "off"]
+    mute = parse_bool(request.values.get("mute"), True)
+    mic = parse_bool(request.values.get("mic"), True)
+    led = parse_bool(request.values.get("led"), True)
     set_record(mute_amp=mute, connect_mic=mic, record_led=led)
     return jsonify(state)
 
@@ -758,4 +1046,4 @@ if __name__ == "__main__":
     setup()
     register_mdns_service()
     debug(f"Starting Flask server on 0.0.0.0:{HTTP_PORT}")
-    app.run(host="0.0.0.0", port=HTTP_PORT)
+    app.run(host="0.0.0.0", port=HTTP_PORT, threaded=True)
