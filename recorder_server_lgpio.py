@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 
 import atexit
+import io
+import queue
+import re
+import shutil
 import socket
+import subprocess
 import time
+import wave
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from zeroconf import ServiceInfo, Zeroconf
 import lgpio
+
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
 
 
 # ============================================================
@@ -59,6 +70,19 @@ HTTP_PORT = 5000
 # mDNS/Bonjour service type.
 SERVICE_TYPE = "_recorder._tcp.local."
 
+# Audio capture. Prefer ALSA/arecord for USB sound cards on Raspberry Pi.
+# Install with:
+#   sudo apt install alsa-utils
+#
+# If arecord is unavailable, the code can fall back to sounddevice/PortAudio:
+#   python3 -m pip install sounddevice
+DEFAULT_AUDIO_SECONDS = 5.0
+MAX_AUDIO_SECONDS = 60.0
+DEFAULT_AUDIO_SAMPLE_RATE = 44100
+DEFAULT_AUDIO_CHANNELS = 1
+SAMPLE_WIDTH_BYTES = 2
+AUDIO_CAPTURE_TIMEOUT_EXTRA = 10.0
+
 
 # ============================================================
 # GLOBAL STATE
@@ -91,6 +115,13 @@ def debug(msg: str):
 
 def clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def parse_bool(value, default=True):
+    if value is None:
+        return default
+
+    return str(value).lower() not in ["0", "false", "no", "off"]
 
 
 def normalize_motor_speed(speed) -> int:
@@ -194,6 +225,233 @@ def claim_outputs():
     for pin in pins:
         lgpio.gpio_claim_output(h, pin, 0)
         debug(f"Claimed GPIO {pin} as output")
+
+
+# ============================================================
+# AUDIO CAPTURE
+# ============================================================
+
+def require_audio_backend():
+    if sd is None:
+        raise RuntimeError(
+            "No audio backend found. Install ALSA utilities with "
+            "'sudo apt install alsa-utils', or install Python package 'sounddevice'."
+        )
+
+
+def find_arecord():
+    return shutil.which("arecord")
+
+
+def parse_audio_device(value):
+    if value is None or str(value).strip() == "":
+        return None
+
+    value = str(value).strip()
+
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+def list_alsa_inputs():
+    arecord = find_arecord()
+
+    if not arecord:
+        raise RuntimeError("ALSA command 'arecord' was not found. Install it with 'sudo apt install alsa-utils'.")
+
+    devices = [{"id": "default", "name": "ALSA default input"}]
+
+    list_pcms = subprocess.run(
+        [arecord, "-L"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    if list_pcms.stdout:
+        for line in list_pcms.stdout.splitlines():
+            if not line or line[0].isspace():
+                continue
+
+            pcm_name = line.strip()
+
+            if pcm_name and pcm_name != "null":
+                devices.append({"id": pcm_name, "name": pcm_name})
+
+    list_cards = subprocess.run(
+        [arecord, "-l"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    card_pattern = re.compile(r"^card\s+(\d+):\s+([^\[]+).*device\s+(\d+):\s+([^\[]+)")
+
+    if list_cards.stdout:
+        for line in list_cards.stdout.splitlines():
+            match = card_pattern.search(line)
+
+            if not match:
+                continue
+
+            card, card_name, device, device_name = match.groups()
+            device_id = f"plughw:{card},{device}"
+            label = f"{card_name.strip()} / {device_name.strip()}"
+
+            if not any(existing["id"] == device_id for existing in devices):
+                devices.append({"id": device_id, "name": label})
+
+    return {
+        "backend": "alsa",
+        "default_input": "default",
+        "inputs": devices,
+        "arecord_l": list_cards.stdout.strip(),
+    }
+
+
+def list_sounddevice_inputs():
+    require_audio_backend()
+
+    devices = []
+
+    for index, device in enumerate(sd.query_devices()):
+        if int(device.get("max_input_channels", 0)) <= 0:
+            continue
+
+        devices.append({
+            "id": str(index),
+            "name": device.get("name", ""),
+            "max_input_channels": int(device.get("max_input_channels", 0)),
+            "default_samplerate": int(device.get("default_samplerate", 0)),
+        })
+
+    default_input = sd.default.device[0]
+
+    return {
+        "backend": "sounddevice",
+        "default_input": default_input if default_input is not None else None,
+        "inputs": devices,
+    }
+
+
+def list_audio_inputs():
+    if find_arecord():
+        return list_alsa_inputs()
+
+    return list_sounddevice_inputs()
+
+
+def record_audio_wav_with_arecord(seconds, samplerate, channels, device=None):
+    arecord = find_arecord()
+
+    if not arecord:
+        raise RuntimeError("ALSA command 'arecord' was not found. Install it with 'sudo apt install alsa-utils'.")
+
+    seconds = float(clamp(float(seconds), 0.1, MAX_AUDIO_SECONDS))
+    samplerate = int(clamp(int(samplerate), 8000, 96000))
+    channels = int(clamp(int(channels), 1, 2))
+    total_frames = int(seconds * samplerate)
+
+    command = [
+        arecord,
+        "-q",
+        "-D",
+        device or "default",
+        "-f",
+        "S16_LE",
+        "-r",
+        str(samplerate),
+        "-c",
+        str(channels),
+        "--samples",
+        str(total_frames),
+        "-t",
+        "wav",
+    ]
+
+    debug(f"ALSA capture start: {' '.join(command)}")
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        timeout=seconds + AUDIO_CAPTURE_TIMEOUT_EXTRA,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"arecord failed with exit {result.returncode}: {stderr}")
+
+    debug(f"ALSA capture complete: bytes={len(result.stdout)}")
+
+    return result.stdout
+
+
+def record_audio_wav_with_sounddevice(seconds, samplerate, channels, device=None):
+    require_audio_backend()
+
+    seconds = float(clamp(float(seconds), 0.1, MAX_AUDIO_SECONDS))
+    samplerate = int(clamp(int(samplerate), 8000, 96000))
+    channels = int(clamp(int(channels), 1, 2))
+    total_frames = int(seconds * samplerate)
+
+    audio_queue = queue.Queue()
+
+    def callback(indata, frames, time_info, status):
+        del time_info
+
+        if status:
+            debug(f"Audio capture status: {status}")
+
+        audio_queue.put(bytes(indata))
+
+    debug(
+        f"Audio capture start: seconds={seconds:.2f}, "
+        f"samplerate={samplerate}, channels={channels}, device={device}"
+    )
+
+    with sd.RawInputStream(
+        samplerate=samplerate,
+        channels=channels,
+        dtype="int16",
+        device=device,
+        callback=callback,
+    ):
+        sd.sleep(int(seconds * 1000))
+
+    chunks = []
+    frames_collected = 0
+    bytes_per_frame = channels * SAMPLE_WIDTH_BYTES
+
+    while not audio_queue.empty() and frames_collected < total_frames:
+        chunk = audio_queue.get_nowait()
+        remaining_bytes = (total_frames - frames_collected) * bytes_per_frame
+        chunk = chunk[:remaining_bytes]
+        chunks.append(chunk)
+        frames_collected += len(chunk) // bytes_per_frame
+
+    wav_buffer = io.BytesIO()
+
+    with wave.open(wav_buffer, "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(SAMPLE_WIDTH_BYTES)
+        wav.setframerate(samplerate)
+        wav.writeframes(b"".join(chunks))
+
+    debug(f"Audio capture complete: frames={frames_collected}")
+
+    return wav_buffer.getvalue()
+
+
+def record_audio_wav(seconds, samplerate, channels, device=None):
+    if find_arecord():
+        return record_audio_wav_with_arecord(seconds, samplerate, channels, device)
+
+    return record_audio_wav_with_sounddevice(seconds, samplerate, channels, device)
 
 
 # ============================================================
@@ -680,9 +938,9 @@ def route_play():
 @app.route("/record", methods=["GET", "POST"])
 def route_record():
     debug("HTTP /record")
-    mute = request.values.get("mute", "1").lower() not in ["0", "false", "no", "off"]
-    mic = request.values.get("mic", "1").lower() not in ["0", "false", "no", "off"]
-    led = request.values.get("led", "1").lower() not in ["0", "false", "no", "off"]
+    mute = parse_bool(request.values.get("mute"), True)
+    mic = parse_bool(request.values.get("mic"), True)
+    led = parse_bool(request.values.get("led"), True)
     set_record(mute_amp=mute, connect_mic=mic, record_led=led)
     return jsonify(state)
 
@@ -750,6 +1008,41 @@ def route_stop():
     return jsonify(state)
 
 
+@app.get("/audio/devices")
+def route_audio_devices():
+    debug("HTTP /audio/devices")
+
+    try:
+        return jsonify(list_audio_inputs())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/audio/record")
+def route_audio_record():
+    debug("HTTP /audio/record")
+
+    try:
+        seconds = request.values.get("seconds", DEFAULT_AUDIO_SECONDS)
+        samplerate = request.values.get("samplerate", DEFAULT_AUDIO_SAMPLE_RATE)
+        channels = request.values.get("channels", DEFAULT_AUDIO_CHANNELS)
+        device = parse_audio_device(request.values.get("device"))
+
+        wav_bytes = record_audio_wav(seconds, samplerate, channels, device)
+
+        return Response(
+            wav_bytes,
+            mimetype="audio/wav",
+            headers={
+                "Content-Disposition": "attachment; filename=recorder_capture.wav",
+            },
+        )
+
+    except Exception as e:
+        debug(f"Audio capture error: {type(e).__name__}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -758,4 +1051,4 @@ if __name__ == "__main__":
     setup()
     register_mdns_service()
     debug(f"Starting Flask server on 0.0.0.0:{HTTP_PORT}")
-    app.run(host="0.0.0.0", port=HTTP_PORT)
+    app.run(host="0.0.0.0", port=HTTP_PORT, threaded=True)
