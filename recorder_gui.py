@@ -87,7 +87,7 @@ class RecorderGUI:
         self.audio_starting = False
 
         self.manual_host = tk.StringVar(value="192.168.0.9")
-        self.audio_device = tk.StringVar(value="default")
+        self.audio_device = tk.StringVar(value="auto")
 
         self.motor_speed = tk.IntVar(value=MIN_MOTOR_SPEED)
         self.zeroconf = Zeroconf()

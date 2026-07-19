@@ -63,7 +63,7 @@ HTTP_PORT = 5000
 SERVICE_TYPE = "_recorder._tcp.local."
 
 # USB sound-card monitor stream.
-AUDIO_DEVICE = "default"
+AUDIO_DEVICE = "auto"
 AUDIO_RATE = 44100
 AUDIO_CHANNELS = 1
 AUDIO_FORMAT = "S16_LE"
@@ -319,7 +319,7 @@ def choose_alsa_capture_device(device=None):
         return chosen
 
     debug("No hardware ALSA capture input found; falling back to ALSA default")
-    return AUDIO_DEVICE
+    return "default"
 
 
 def record_audio_wav_with_arecord(seconds, samplerate, channels, device=None):
@@ -821,7 +821,7 @@ def route_audio_stream():
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             bufsize=0,
         )
 
@@ -840,14 +840,21 @@ def route_audio_stream():
             debug("Audio stream client disconnected")
 
         finally:
-            proc.terminate()
+            if proc.poll() is None:
+                proc.terminate()
 
             try:
                 proc.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                proc.wait(timeout=1)
 
-            debug("Audio stream stopped")
+            stderr = proc.stderr.read().decode(errors="replace").strip()
+
+            if stderr:
+                debug(f"Audio stream arecord stderr: {stderr}")
+
+            debug(f"Audio stream stopped with exit {proc.returncode}")
 
     return Response(
         stream_with_context(generate()),
