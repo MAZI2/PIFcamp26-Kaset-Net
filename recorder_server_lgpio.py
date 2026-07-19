@@ -61,7 +61,7 @@ ERASE_DUTY_PERCENT = 45
 
 # Motor PWM.
 MIN_MOTOR_SPEED = 180
-DEFAULT_MOTOR_SPEED = MIN_MOTOR_SPEED
+DEFAULT_MOTOR_SPEED = 220
 MOTOR_PWM_FREQ_HZ = 20000
 
 # Web server.
@@ -644,7 +644,8 @@ def ensure_motor_for_record():
         apply_motor()
         return
 
-    debug(f"Record mode preserving running motor at speed {speed}")
+    debug(f"Record mode reapplying motor at speed {speed}")
+    apply_motor()
 
 
 def set_record(mute_amp=True, connect_mic=True, record_led=True):
@@ -981,6 +982,11 @@ def route_record():
     mute = parse_bool(request.values.get("mute"), True)
     mic = parse_bool(request.values.get("mic"), True)
     led = parse_bool(request.values.get("led"), True)
+    speed = request.values.get("speed")
+
+    if speed is not None:
+        state["motor_speed"] = normalize_motor_speed(speed)
+
     set_record(mute_amp=mute, connect_mic=mic, record_led=led)
     return jsonify(state)
 
