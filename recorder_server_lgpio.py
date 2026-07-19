@@ -261,7 +261,7 @@ def list_alsa_inputs():
     if not arecord:
         raise RuntimeError("ALSA command 'arecord' was not found. Install it with 'sudo apt install alsa-utils'.")
 
-    devices = [{"id": "default", "name": "ALSA default input"}]
+    devices = [{"id": "auto", "name": "Auto-detect first ALSA capture input"}]
 
     list_pcms = subprocess.run(
         [arecord, "-L"],
@@ -289,28 +289,67 @@ def list_alsa_inputs():
         check=False,
     )
 
-    card_pattern = re.compile(r"^card\s+(\d+):\s+([^\[]+).*device\s+(\d+):\s+([^\[]+)")
+    capture_devices = parse_alsa_capture_devices(list_cards.stdout)
 
-    if list_cards.stdout:
-        for line in list_cards.stdout.splitlines():
-            match = card_pattern.search(line)
-
-            if not match:
-                continue
-
-            card, card_name, device, device_name = match.groups()
-            device_id = f"plughw:{card},{device}"
-            label = f"{card_name.strip()} / {device_name.strip()}"
-
-            if not any(existing["id"] == device_id for existing in devices):
-                devices.append({"id": device_id, "name": label})
+    for capture_device in capture_devices:
+        if not any(existing["id"] == capture_device["id"] for existing in devices):
+            devices.append(capture_device)
 
     return {
         "backend": "alsa",
-        "default_input": "default",
+        "default_input": "auto",
         "inputs": devices,
         "arecord_l": list_cards.stdout.strip(),
     }
+
+
+def parse_alsa_capture_devices(arecord_output):
+    card_pattern = re.compile(r"^card\s+(\d+):\s+([^\[]+).*device\s+(\d+):\s+([^\[]+)")
+    devices = []
+
+    if not arecord_output:
+        return devices
+
+    for line in arecord_output.splitlines():
+        match = card_pattern.search(line)
+
+        if not match:
+            continue
+
+        card, card_name, device, device_name = match.groups()
+        device_id = f"plughw:{card},{device}"
+        label = f"{card_name.strip()} / {device_name.strip()}"
+        devices.append({"id": device_id, "name": label})
+
+    return devices
+
+
+def choose_alsa_capture_device(device=None):
+    if device and device not in ["auto", "default"]:
+        return device
+
+    arecord = find_arecord()
+
+    if not arecord:
+        raise RuntimeError("ALSA command 'arecord' was not found. Install it with 'sudo apt install alsa-utils'.")
+
+    result = subprocess.run(
+        [arecord, "-l"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    devices = parse_alsa_capture_devices(result.stdout)
+
+    if devices:
+        chosen = devices[0]["id"]
+        debug(f"ALSA auto-selected capture input: {chosen} ({devices[0]['name']})")
+        return chosen
+
+    debug("No hardware ALSA capture input found; falling back to ALSA default")
+    return "default"
 
 
 def list_sounddevice_inputs():
@@ -355,12 +394,13 @@ def record_audio_wav_with_arecord(seconds, samplerate, channels, device=None):
     samplerate = int(clamp(int(samplerate), 8000, 96000))
     channels = int(clamp(int(channels), 1, 2))
     total_frames = int(seconds * samplerate)
+    device = choose_alsa_capture_device(device)
 
     command = [
         arecord,
         "-q",
         "-D",
-        device or "default",
+        device,
         "-f",
         "S16_LE",
         "-r",
