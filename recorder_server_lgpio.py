@@ -814,7 +814,7 @@ def route_audio_stream():
         "-f", AUDIO_FORMAT,
         "-r", str(rate),
         "-c", str(channels),
-        "-t", "wav",
+        "-t", "raw",
     ]
 
     def generate():
@@ -858,7 +858,7 @@ def route_audio_stream():
 
     return Response(
         stream_with_context(generate()),
-        mimetype="audio/wav",
+        mimetype="application/octet-stream",
         headers={
             "Cache-Control": "no-store",
             "X-Accel-Buffering": "no",

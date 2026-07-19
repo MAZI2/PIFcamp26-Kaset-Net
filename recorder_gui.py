@@ -320,11 +320,14 @@ class RecorderGUI:
                         self.log(f"[AUDIO] Monitor exited immediately with code {proc.returncode}")
 
                 elif event == "audio_exited":
-                    proc, returncode = payload
+                    proc, returncode, stderr = payload
 
                     if self.audio_process is proc:
                         self.audio_process = None
                         self.log(f"[AUDIO] Monitor exited with code {returncode}")
+
+                        if stderr:
+                            self.log(f"[AUDIO] ffplay stderr:\n{stderr[-2000:]}")
 
                 elif event == "audio_error":
                     self.audio_starting = False
@@ -548,11 +551,14 @@ class RecorderGUI:
         cmd = [
             ffplay,
             "-nodisp",
-            "-autoexit",
+            "-loglevel", "warning",
             "-fflags", "nobuffer",
             "-flags", "low_delay",
             "-probesize", "32",
             "-analyzeduration", "0",
+            "-f", "s16le",
+            "-ar", "44100",
+            "-ac", "1",
             stream_url,
         ]
 
@@ -572,12 +578,13 @@ class RecorderGUI:
                 cmd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 start_new_session=True,
+                text=True,
             )
             self.event_queue.put(("audio_started", (proc, stream_url)))
-            returncode = proc.wait()
-            self.event_queue.put(("audio_exited", (proc, returncode)))
+            _, stderr = proc.communicate()
+            self.event_queue.put(("audio_exited", (proc, proc.returncode, stderr)))
 
         except Exception as e:
             self.event_queue.put((
