@@ -2,9 +2,12 @@
 
 import json
 import queue
+import shutil
+import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import requests
 from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
@@ -12,6 +15,7 @@ from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 
 SERVICE_TYPE = "_recorder._tcp.local."
 MIN_MOTOR_SPEED = 180
+RECORD_PATH = "/record?led=0"
 REQUEST_TIMEOUT = 3.0
 
 
@@ -79,13 +83,12 @@ class RecorderGUI:
 
         self.event_queue = queue.Queue()
         self.devices = {}
+        self.audio_process = None
 
-        self.selected_url = tk.StringVar()
-        self.manual_host = tk.StringVar(value="http://raspberrypi.local:5000")
+        self.manual_host = tk.StringVar(value="192.168.0.9")
+        self.audio_device = tk.StringVar(value="default")
 
         self.motor_speed = tk.IntVar(value=MIN_MOTOR_SPEED)
-        self.erase_freq = tk.IntVar(value=20000)
-
         self.zeroconf = Zeroconf()
         self.listener = RecorderDiscovery(self.event_queue)
         self.browser = ServiceBrowser(self.zeroconf, SERVICE_TYPE, self.listener)
@@ -109,17 +112,34 @@ class RecorderGUI:
         discovery_frame = ttk.LabelFrame(main, text="Discovered recorders", padding=10)
         discovery_frame.pack(fill=tk.X)
 
-        self.device_combo = ttk.Combobox(
-            discovery_frame,
-            textvariable=self.selected_url,
-            state="readonly",
-            width=95,
+        list_frame = ttk.Frame(discovery_frame)
+        list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+
+        self.device_list = tk.Listbox(
+            list_frame,
+            selectmode=tk.EXTENDED,
+            height=5,
+            exportselection=False,
         )
-        self.device_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.device_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        device_scroll = ttk.Scrollbar(
+            list_frame,
+            orient=tk.VERTICAL,
+            command=self.device_list.yview,
+        )
+        device_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.device_list.configure(yscrollcommand=device_scroll.set)
 
         ttk.Button(
             discovery_frame,
-            text="Status",
+            text="Select All",
+            command=self.select_all_devices,
+        ).pack(side=tk.LEFT, padx=3)
+
+        ttk.Button(
+            discovery_frame,
+            text="Status All",
             command=self.status,
         ).pack(side=tk.LEFT, padx=3)
 
@@ -130,7 +150,7 @@ class RecorderGUI:
         ).pack(side=tk.LEFT, padx=3)
 
         # Manual host
-        manual_frame = ttk.LabelFrame(main, text="Manual recorder URL", padding=10)
+        manual_frame = ttk.LabelFrame(main, text="Add recorder by IP or URL", padding=10)
         manual_frame.pack(fill=tk.X, pady=(10, 0))
 
         ttk.Entry(
@@ -141,13 +161,13 @@ class RecorderGUI:
 
         ttk.Button(
             manual_frame,
-            text="Use Manual",
+            text="Add IP",
             command=self.use_manual_host,
         ).pack(side=tk.LEFT, padx=3)
 
         ttk.Button(
             manual_frame,
-            text="Test Manual",
+            text="Add + Test",
             command=self.test_manual_host,
         ).pack(side=tk.LEFT, padx=3)
 
@@ -158,28 +178,15 @@ class RecorderGUI:
         ttk.Button(power_frame, text="Power ON", command=lambda: self.command("/power/on")).pack(side=tk.LEFT, padx=3)
         ttk.Button(power_frame, text="Power OFF", command=lambda: self.command("/power/off")).pack(side=tk.LEFT, padx=3)
         ttk.Button(power_frame, text="Play", command=lambda: self.command("/play")).pack(side=tk.LEFT, padx=3)
-        ttk.Button(power_frame, text="Record", command=lambda: self.command("/record")).pack(side=tk.LEFT, padx=3)
+        ttk.Button(power_frame, text="Record", command=lambda: self.command(RECORD_PATH)).pack(side=tk.LEFT, padx=3)
         ttk.Button(power_frame, text="Status", command=lambda: self.command("/status")).pack(side=tk.LEFT, padx=3)
 
         # Erase commands
         erase_frame = ttk.LabelFrame(main, text="Erase", padding=10)
         erase_frame.pack(fill=tk.X, pady=(10, 0))
 
-        ttk.Label(erase_frame, text="Frequency Hz:").pack(side=tk.LEFT, padx=3)
-
-        ttk.Entry(
-            erase_frame,
-            textvariable=self.erase_freq,
-            width=10,
-        ).pack(side=tk.LEFT, padx=3)
-
         ttk.Button(erase_frame, text="Erase ON", command=self.erase_on).pack(side=tk.LEFT, padx=3)
         ttk.Button(erase_frame, text="Erase OFF", command=lambda: self.command("/erase/off")).pack(side=tk.LEFT, padx=3)
-
-        ttk.Button(erase_frame, text="20 kHz", command=lambda: self.erase_on_fixed(20000)).pack(side=tk.LEFT, padx=3)
-        ttk.Button(erase_frame, text="30 kHz", command=lambda: self.erase_on_fixed(30000)).pack(side=tk.LEFT, padx=3)
-        ttk.Button(erase_frame, text="40 kHz", command=lambda: self.erase_on_fixed(40000)).pack(side=tk.LEFT, padx=3)
-        ttk.Button(erase_frame, text="50 kHz", command=lambda: self.erase_on_fixed(50000)).pack(side=tk.LEFT, padx=3)
 
         # Motor commands
         motor_frame = ttk.LabelFrame(main, text="Motor", padding=10)
@@ -211,6 +218,22 @@ class RecorderGUI:
         ttk.Button(direction_frame, text="Reverse", command=lambda: self.command("/reverse/on")).pack(side=tk.LEFT, padx=3)
         ttk.Button(direction_frame, text="Forward + Speed", command=self.motor_forward).pack(side=tk.LEFT, padx=3)
         ttk.Button(direction_frame, text="Reverse + Speed", command=self.motor_reverse).pack(side=tk.LEFT, padx=3)
+
+        # Audio monitor
+        audio_frame = ttk.LabelFrame(main, text="Audio monitor", padding=10)
+        audio_frame.pack(fill=tk.X, pady=(10, 0))
+
+        ttk.Label(audio_frame, text="ALSA device:").pack(side=tk.LEFT, padx=3)
+
+        ttk.Entry(
+            audio_frame,
+            textvariable=self.audio_device,
+            width=16,
+        ).pack(side=tk.LEFT, padx=3)
+
+        ttk.Button(audio_frame, text="Start Monitor", command=self.start_audio_monitor).pack(side=tk.LEFT, padx=3)
+        ttk.Button(audio_frame, text="Stop Monitor", command=self.stop_audio_monitor).pack(side=tk.LEFT, padx=3)
+        ttk.Button(audio_frame, text="List Devices", command=lambda: self.command("/audio/devices")).pack(side=tk.LEFT, padx=3)
 
         # Quick command entry
         custom_frame = ttk.LabelFrame(main, text="Custom endpoint", padding=10)
@@ -264,35 +287,54 @@ class RecorderGUI:
                     self.log(payload)
 
                 elif event == "device_added":
-                    self.devices[payload["name"]] = payload
+                    self.devices[payload["url"]] = payload
                     self.log(
                         f"[DISCOVERY] Found recorder: {payload['name']} "
                         f"at {payload['url']} props={payload['properties']}"
                     )
-                    self.refresh_device_combo()
+                    self.refresh_device_list()
 
                 elif event == "device_removed":
-                    if payload in self.devices:
-                        removed = self.devices.pop(payload)
+                    removed_urls = [
+                        url for url, dev in self.devices.items()
+                        if dev["name"] == payload
+                    ]
+
+                    for url in removed_urls:
+                        removed = self.devices.pop(url)
                         self.log(f"[DISCOVERY] Removed recorder: {payload} at {removed['url']}")
-                        self.refresh_device_combo()
+
+                    if removed_urls:
+                        self.refresh_device_list()
 
         except queue.Empty:
             pass
 
         self.root.after(100, self.process_events)
 
-    def refresh_device_combo(self):
-        values = []
+    def device_label(self, dev):
+        return f"{dev['url']}  |  {dev['name']}"
 
-        for name, dev in sorted(self.devices.items()):
-            values.append(f"{dev['url']}  |  {name}")
+    def refresh_device_list(self):
+        selected_urls = set(self.get_selected_base_urls(allow_empty=True))
 
-        self.device_combo["values"] = values
+        self.device_list.delete(0, tk.END)
 
-        if values and not self.selected_url.get():
-            self.selected_url.set(values[0])
-            self.log(f"[DISCOVERY] Auto-selected: {values[0]}")
+        sorted_devices = sorted(self.devices.values(), key=lambda dev: dev["url"])
+
+        for dev in sorted_devices:
+            self.device_list.insert(tk.END, self.device_label(dev))
+
+        for index, dev in enumerate(sorted_devices):
+            if dev["url"] in selected_urls or not selected_urls:
+                self.device_list.selection_set(index)
+
+        if sorted_devices:
+            self.log(f"[TARGETS] {len(sorted_devices)} recorder(s) available; selected {len(self.device_list.curselection())}")
+
+    def select_all_devices(self):
+        self.device_list.selection_set(0, tk.END)
+        self.log(f"[TARGETS] Selected {len(self.device_list.curselection())} recorder(s)")
 
     # --------------------------------------------------------
     # URL / REQUEST HELPERS
@@ -304,44 +346,95 @@ class RecorderGUI:
         if not url.startswith("http://") and not url.startswith("https://"):
             url = "http://" + url
 
+        parts = urlsplit(url)
+
+        if parts.scheme == "http" and parts.hostname and parts.port is None:
+            netloc = f"{parts.hostname}:5000"
+
+            if parts.username:
+                auth = parts.username
+
+                if parts.password:
+                    auth += f":{parts.password}"
+
+                netloc = f"{auth}@{netloc}"
+
+            url = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
         return url
 
-    def get_base_url(self):
-        selected = self.selected_url.get().strip()
+    def get_selected_base_urls(self, allow_empty=False):
+        urls = []
 
-        if selected:
-            # Combobox value format: "http://ip:port | name"
-            return selected.split("|")[0].strip().rstrip("/")
+        for index in self.device_list.curselection():
+            label = self.device_list.get(index)
+            urls.append(label.split("|")[0].strip().rstrip("/"))
 
-        manual = self.manual_host.get().strip()
+        if urls or allow_empty:
+            return urls
 
-        if manual:
-            return self.normalize_url(manual)
+        raise RuntimeError("No recorder selected. Add/select at least one recorder.")
 
-        raise RuntimeError("No recorder selected or entered manually")
+    def get_primary_base_url(self):
+        urls = self.get_selected_base_urls()
+        return urls[0]
+
+    def add_manual_host(self):
+        url = self.normalize_url(self.manual_host.get())
+
+        dev = {
+            "name": "Manual recorder",
+            "ip": url,
+            "port": "",
+            "url": url,
+            "properties": {"source": "manual"},
+        }
+
+        self.devices[url] = dev
+        self.refresh_device_list()
+
+        for index in range(self.device_list.size()):
+            if self.device_list.get(index).startswith(url):
+                self.device_list.selection_set(index)
+                break
+
+        return url
 
     def use_manual_host(self):
-        url = self.normalize_url(self.manual_host.get())
-        self.selected_url.set(url)
-        self.log(f"[MANUAL] Using manual host: {url}")
+        url = self.add_manual_host()
+        self.log(f"[MANUAL] Added recorder target: {url}")
 
     def test_manual_host(self):
         self.use_manual_host()
         self.command("/status")
 
     def request_async(self, path):
-        thread = threading.Thread(target=self._request_worker, args=(path,), daemon=True)
+        try:
+            base_urls = self.get_selected_base_urls()
+        except Exception as e:
+            self.log(f"[ERROR] {type(e).__name__}: {e}")
+            return
+
+        thread = threading.Thread(
+            target=self._request_group_worker,
+            args=(path, base_urls),
+            daemon=True,
+        )
         thread.start()
 
-    def _request_worker(self, path):
+    def build_url_for(self, base_url, path):
+        if not path.startswith("/"):
+            path = "/" + path
+
+        return base_url.rstrip("/") + path
+
+    def build_url(self, path):
+        return self.build_url_for(self.get_primary_base_url(), path)
+
+    def _request_one(self, url, start_event):
+        start_event.wait()
+
         try:
-            base_url = self.get_base_url()
-
-            if not path.startswith("/"):
-                path = "/" + path
-
-            url = base_url.rstrip("/") + path
-
             self.event_queue.put(("debug", f"[REQUEST] GET {url}"))
 
             response = requests.get(url, timeout=REQUEST_TIMEOUT)
@@ -357,7 +450,28 @@ class RecorderGUI:
                 self.event_queue.put(("debug", f"[TEXT]\n{text}"))
 
         except Exception as e:
-            self.event_queue.put(("debug", f"[ERROR] {type(e).__name__}: {e}"))
+            self.event_queue.put(("debug", f"[ERROR] {url} {type(e).__name__}: {e}"))
+
+    def _request_group_worker(self, path, base_urls):
+        self.event_queue.put(("debug", f"[GROUP] GET {path} -> {len(base_urls)} recorder(s)"))
+
+        start_event = threading.Event()
+        workers = []
+
+        for base_url in base_urls:
+            url = self.build_url_for(base_url, path)
+            worker = threading.Thread(
+                target=self._request_one,
+                args=(url, start_event),
+                daemon=True,
+            )
+            workers.append(worker)
+            worker.start()
+
+        start_event.set()
+
+        for worker in workers:
+            worker.join()
 
     # --------------------------------------------------------
     # COMMANDS
@@ -370,12 +484,7 @@ class RecorderGUI:
         self.command("/status")
 
     def erase_on(self):
-        freq = self.erase_freq.get()
-        self.command(f"/erase/on?freq={freq}")
-
-    def erase_on_fixed(self, freq):
-        self.erase_freq.set(freq)
-        self.command(f"/erase/on?freq={freq}")
+        self.command("/erase/on?freq=20000")
 
     def on_speed_slider(self, value):
         speed = max(MIN_MOTOR_SPEED, int(float(value)))
@@ -394,6 +503,60 @@ class RecorderGUI:
         speed = self.motor_speed.get()
         self.command(f"/motor?speed={speed}&reverse=1")
 
+    def start_audio_monitor(self):
+        if self.audio_process and self.audio_process.poll() is None:
+            self.log("[AUDIO] Monitor already running")
+            return
+
+        ffplay = shutil.which("ffplay")
+
+        if not ffplay:
+            self.log("[AUDIO] ffplay not found. Install ffmpeg/ffplay on this computer.")
+            return
+
+        device = quote(self.audio_device.get().strip() or "default", safe="")
+        stream_url = self.build_url(f"/audio/stream?device={device}")
+
+        cmd = [
+            ffplay,
+            "-nodisp",
+            "-autoexit",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-probesize", "32",
+            "-analyzeduration", "0",
+            stream_url,
+        ]
+
+        try:
+            self.audio_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.log(f"[AUDIO] Monitor started: {stream_url}")
+
+        except Exception as e:
+            self.audio_process = None
+            self.log(f"[AUDIO] Could not start monitor: {type(e).__name__}: {e}")
+
+    def stop_audio_monitor(self, quiet=False):
+        if not self.audio_process or self.audio_process.poll() is not None:
+            self.audio_process = None
+            if not quiet:
+                self.log("[AUDIO] Monitor is not running")
+            return
+
+        self.audio_process.terminate()
+
+        try:
+            self.audio_process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            self.audio_process.kill()
+
+        self.audio_process = None
+        self.log("[AUDIO] Monitor stopped")
+
     def send_custom(self):
         path = self.custom_path.get().strip()
         self.command(path)
@@ -405,6 +568,8 @@ class RecorderGUI:
             self.zeroconf.close()
         except Exception:
             pass
+
+        self.stop_audio_monitor(quiet=True)
 
         self.root.destroy()
 
