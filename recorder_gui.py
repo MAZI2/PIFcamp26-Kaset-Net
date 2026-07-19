@@ -84,6 +84,7 @@ class RecorderGUI:
         self.event_queue = queue.Queue()
         self.devices = {}
         self.audio_process = None
+        self.audio_starting = False
 
         self.manual_host = tk.StringVar(value="192.168.0.9")
         self.audio_device = tk.StringVar(value="default")
@@ -307,6 +308,29 @@ class RecorderGUI:
                     if removed_urls:
                         self.refresh_device_list()
 
+                elif event == "audio_started":
+                    proc, stream_url = payload
+                    self.audio_starting = False
+
+                    if proc.poll() is None:
+                        self.audio_process = proc
+                        self.log(f"[AUDIO] Monitor started: {stream_url}")
+                    else:
+                        self.audio_process = None
+                        self.log(f"[AUDIO] Monitor exited immediately with code {proc.returncode}")
+
+                elif event == "audio_exited":
+                    proc, returncode = payload
+
+                    if self.audio_process is proc:
+                        self.audio_process = None
+                        self.log(f"[AUDIO] Monitor exited with code {returncode}")
+
+                elif event == "audio_error":
+                    self.audio_starting = False
+                    self.audio_process = None
+                    self.log(payload)
+
         except queue.Empty:
             pass
 
@@ -504,6 +528,10 @@ class RecorderGUI:
         self.command(f"/motor?speed={speed}&reverse=1")
 
     def start_audio_monitor(self):
+        if self.audio_starting:
+            self.log("[AUDIO] Monitor is starting")
+            return
+
         if self.audio_process and self.audio_process.poll() is None:
             self.log("[AUDIO] Monitor already running")
             return
@@ -528,19 +556,42 @@ class RecorderGUI:
             stream_url,
         ]
 
+        self.audio_starting = True
+        self.log(f"[AUDIO] Starting monitor: {stream_url}")
+
+        thread = threading.Thread(
+            target=self._start_audio_monitor_worker,
+            args=(cmd, stream_url),
+            daemon=True,
+        )
+        thread.start()
+
+    def _start_audio_monitor_worker(self, cmd, stream_url):
         try:
-            self.audio_process = subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
-            self.log(f"[AUDIO] Monitor started: {stream_url}")
+            self.event_queue.put(("audio_started", (proc, stream_url)))
+            returncode = proc.wait()
+            self.event_queue.put(("audio_exited", (proc, returncode)))
 
         except Exception as e:
-            self.audio_process = None
-            self.log(f"[AUDIO] Could not start monitor: {type(e).__name__}: {e}")
+            self.event_queue.put((
+                "audio_error",
+                f"[AUDIO] Could not start monitor: {type(e).__name__}: {e}",
+            ))
 
     def stop_audio_monitor(self, quiet=False):
+        if self.audio_starting:
+            self.audio_starting = False
+            if not quiet:
+                self.log("[AUDIO] Monitor launch is still in progress")
+            return
+
         if not self.audio_process or self.audio_process.poll() is not None:
             self.audio_process = None
             if not quiet:
