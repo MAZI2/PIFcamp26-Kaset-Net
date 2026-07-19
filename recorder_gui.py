@@ -13,7 +13,6 @@ from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 
 SERVICE_TYPE = "_recorder._tcp.local."
 MIN_MOTOR_SPEED = 180
-DEFAULT_MOTOR_SPEED = 220
 REQUEST_TIMEOUT = 3.0
 AUDIO_REQUEST_EXTRA_TIMEOUT = 10.0
 
@@ -86,7 +85,7 @@ class RecorderGUI:
         self.selected_url = tk.StringVar()
         self.manual_host = tk.StringVar(value="http://raspberrypi.local:5000")
 
-        self.motor_speed = tk.IntVar(value=DEFAULT_MOTOR_SPEED)
+        self.motor_speed = tk.IntVar(value=MIN_MOTOR_SPEED)
         self.erase_freq = tk.IntVar(value=20000)
         self.audio_seconds = tk.DoubleVar(value=5.0)
         self.audio_samplerate = tk.IntVar(value=44100)
@@ -165,7 +164,7 @@ class RecorderGUI:
         ttk.Button(power_frame, text="Power ON", command=lambda: self.command("/power/on")).pack(side=tk.LEFT, padx=3)
         ttk.Button(power_frame, text="Power OFF", command=lambda: self.command("/power/off")).pack(side=tk.LEFT, padx=3)
         ttk.Button(power_frame, text="Play", command=lambda: self.command("/play")).pack(side=tk.LEFT, padx=3)
-        ttk.Button(power_frame, text="Record", command=self.record).pack(side=tk.LEFT, padx=3)
+        ttk.Button(power_frame, text="Record", command=lambda: self.command("/record")).pack(side=tk.LEFT, padx=3)
         ttk.Button(power_frame, text="Status", command=lambda: self.command("/status")).pack(side=tk.LEFT, padx=3)
 
         # Erase commands
@@ -442,10 +441,6 @@ class RecorderGUI:
 
     def status(self):
         self.command("/status")
-
-    def record(self):
-        speed = self.motor_speed.get()
-        self.command(f"/record?speed={speed}")
 
     def erase_on(self):
         freq = self.erase_freq.get()
