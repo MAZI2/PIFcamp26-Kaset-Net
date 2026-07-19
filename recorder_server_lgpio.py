@@ -763,6 +763,11 @@ def route_status():
     return jsonify(state)
 
 
+@app.get("/ping")
+def route_ping():
+    return "pong\n", 200, {"Content-Type": "text/plain"}
+
+
 @app.route("/audio/devices", methods=["GET"])
 def route_audio_devices():
     debug("HTTP /audio/devices")
