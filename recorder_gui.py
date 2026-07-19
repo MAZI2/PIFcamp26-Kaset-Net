@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
+import datetime
 import json
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, filedialog
 
 import requests
 from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
@@ -13,6 +14,7 @@ from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 SERVICE_TYPE = "_recorder._tcp.local."
 MIN_MOTOR_SPEED = 180
 REQUEST_TIMEOUT = 3.0
+AUDIO_REQUEST_EXTRA_TIMEOUT = 10.0
 
 
 # ============================================================
@@ -85,6 +87,10 @@ class RecorderGUI:
 
         self.motor_speed = tk.IntVar(value=MIN_MOTOR_SPEED)
         self.erase_freq = tk.IntVar(value=20000)
+        self.audio_seconds = tk.DoubleVar(value=5.0)
+        self.audio_samplerate = tk.IntVar(value=44100)
+        self.audio_channels = tk.IntVar(value=1)
+        self.audio_device = tk.StringVar(value="Default input")
 
         self.zeroconf = Zeroconf()
         self.listener = RecorderDiscovery(self.event_queue)
@@ -230,6 +236,67 @@ class RecorderGUI:
             command=self.send_custom,
         ).pack(side=tk.LEFT, padx=3)
 
+        # Audio capture
+        audio_frame = ttk.LabelFrame(main, text="Raspberry Pi audio capture", padding=10)
+        audio_frame.pack(fill=tk.X, pady=(10, 0))
+
+        ttk.Label(audio_frame, text="Input:").pack(side=tk.LEFT, padx=3)
+
+        self.audio_device_combo = ttk.Combobox(
+            audio_frame,
+            textvariable=self.audio_device,
+            state="readonly",
+            width=38,
+            values=["Default input"],
+        )
+        self.audio_device_combo.pack(side=tk.LEFT, padx=3)
+
+        ttk.Button(
+            audio_frame,
+            text="Refresh Inputs",
+            command=self.refresh_audio_devices,
+        ).pack(side=tk.LEFT, padx=3)
+
+        ttk.Label(audio_frame, text="Seconds:").pack(side=tk.LEFT, padx=(12, 3))
+
+        ttk.Spinbox(
+            audio_frame,
+            textvariable=self.audio_seconds,
+            from_=0.5,
+            to=60.0,
+            increment=0.5,
+            width=6,
+        ).pack(side=tk.LEFT, padx=3)
+
+        ttk.Label(audio_frame, text="Hz:").pack(side=tk.LEFT, padx=(12, 3))
+
+        ttk.Combobox(
+            audio_frame,
+            textvariable=self.audio_samplerate,
+            state="readonly",
+            width=8,
+            values=[16000, 22050, 44100, 48000],
+        ).pack(side=tk.LEFT, padx=3)
+
+        ttk.Label(audio_frame, text="Ch:").pack(side=tk.LEFT, padx=(12, 3))
+
+        ttk.Spinbox(
+            audio_frame,
+            textvariable=self.audio_channels,
+            from_=1,
+            to=2,
+            width=4,
+        ).pack(side=tk.LEFT, padx=3)
+
+        ttk.Button(
+            audio_frame,
+            text="Capture WAV",
+            command=self.capture_audio,
+        ).pack(side=tk.LEFT, padx=(12, 3))
+
+        self.audio_status = ttk.Label(audio_frame, text="Idle", width=18)
+        self.audio_status.pack(side=tk.LEFT, padx=3)
+
         # Debug log
         log_frame = ttk.LabelFrame(main, text="Debug log", padding=10)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
@@ -276,6 +343,12 @@ class RecorderGUI:
                         removed = self.devices.pop(payload)
                         self.log(f"[DISCOVERY] Removed recorder: {payload} at {removed['url']}")
                         self.refresh_device_combo()
+
+                elif event == "audio_devices":
+                    self.update_audio_devices(payload)
+
+                elif event == "audio_status":
+                    self.audio_status.config(text=payload)
 
         except queue.Empty:
             pass
@@ -397,6 +470,140 @@ class RecorderGUI:
     def send_custom(self):
         path = self.custom_path.get().strip()
         self.command(path)
+
+    # --------------------------------------------------------
+    # AUDIO CAPTURE
+    # --------------------------------------------------------
+
+    def refresh_audio_devices(self):
+        thread = threading.Thread(target=self._audio_devices_worker, daemon=True)
+        thread.start()
+
+    def _audio_devices_worker(self):
+        try:
+            base_url = self.get_base_url()
+            url = base_url.rstrip("/") + "/audio/devices"
+
+            self.event_queue.put(("debug", f"[REQUEST] GET {url}"))
+            self.event_queue.put(("audio_status", "Refreshing"))
+
+            response = requests.get(url, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+
+            data = response.json()
+            self.event_queue.put(("audio_devices", data))
+            self.event_queue.put(("debug", f"[AUDIO]\n{json.dumps(data, indent=2, sort_keys=True)}"))
+            self.event_queue.put(("audio_status", "Inputs loaded"))
+
+        except Exception as e:
+            self.event_queue.put(("debug", f"[AUDIO ERROR] {type(e).__name__}: {e}"))
+            self.event_queue.put(("audio_status", "Input error"))
+
+    def update_audio_devices(self, data):
+        values = ["Default input"]
+
+        for device in data.get("inputs", []):
+            device_id = str(device.get("id", device.get("index", "")))
+            details = []
+
+            if "max_input_channels" in device:
+                details.append(f"{device['max_input_channels']} ch")
+
+            if "default_samplerate" in device:
+                details.append(f"{device['default_samplerate']} Hz")
+
+            suffix = f" ({', '.join(details)})" if details else ""
+            label = f"{device_id} | {device.get('name', device_id)}{suffix}"
+            values.append(label)
+
+        self.audio_device_combo["values"] = values
+
+        if self.audio_device.get() not in values:
+            self.audio_device.set(values[0])
+
+    def selected_audio_device(self):
+        selected = self.audio_device.get().strip()
+
+        if not selected or selected == "Default input":
+            return ""
+
+        return selected.split("|", 1)[0].strip()
+
+    def capture_audio(self):
+        try:
+            seconds = float(self.audio_seconds.get())
+            samplerate = int(self.audio_samplerate.get())
+            channels = int(self.audio_channels.get())
+        except Exception:
+            messagebox.showerror("Audio capture", "Seconds, sample rate, and channels must be numbers.")
+            return
+
+        if seconds <= 0 or seconds > 60:
+            messagebox.showerror("Audio capture", "Seconds must be between 0 and 60.")
+            return
+
+        if channels not in (1, 2):
+            messagebox.showerror("Audio capture", "Channels must be 1 or 2.")
+            return
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        save_path = filedialog.asksaveasfilename(
+            title="Save Raspberry Pi audio capture",
+            initialfile=f"recorder-capture-{timestamp}.wav",
+            defaultextension=".wav",
+            filetypes=[("WAV audio", "*.wav"), ("All files", "*.*")],
+        )
+
+        if not save_path:
+            return
+
+        device = self.selected_audio_device()
+
+        thread = threading.Thread(
+            target=self._capture_audio_worker,
+            args=(save_path, seconds, samplerate, channels, device),
+            daemon=True,
+        )
+        thread.start()
+
+    def _capture_audio_worker(self, save_path, seconds, samplerate, channels, device):
+        try:
+            base_url = self.get_base_url()
+            url = base_url.rstrip("/") + "/audio/record"
+            params = {
+                "seconds": seconds,
+                "samplerate": samplerate,
+                "channels": channels,
+            }
+
+            if device:
+                params["device"] = device
+
+            timeout = max(REQUEST_TIMEOUT, seconds + AUDIO_REQUEST_EXTRA_TIMEOUT)
+
+            self.event_queue.put(("debug", f"[REQUEST] GET {url} params={params}"))
+            self.event_queue.put(("audio_status", "Recording"))
+
+            response = requests.get(url, params=params, timeout=timeout)
+
+            if response.status_code != 200:
+                try:
+                    detail = response.json()
+                    error = detail.get("error", detail)
+                except Exception:
+                    error = response.text[:1000]
+
+                raise RuntimeError(f"HTTP {response.status_code}: {error}")
+
+            with open(save_path, "wb") as wav_file:
+                wav_file.write(response.content)
+
+            self.event_queue.put(("debug", f"[AUDIO] Saved WAV: {save_path} ({len(response.content)} bytes)"))
+            self.event_queue.put(("audio_status", "Saved"))
+
+        except Exception as e:
+            self.event_queue.put(("debug", f"[AUDIO ERROR] {type(e).__name__}: {e}"))
+            self.event_queue.put(("audio_status", "Capture error"))
 
     def quit(self):
         self.log("[QUIT] Closing Zeroconf")
