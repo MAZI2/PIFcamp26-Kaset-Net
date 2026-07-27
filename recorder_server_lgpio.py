@@ -54,7 +54,7 @@ ERASE_DUTY_PERCENT = 45
 # Motor PWM.
 MIN_MOTOR_SPEED = 180
 DEFAULT_MOTOR_SPEED = MIN_MOTOR_SPEED
-MOTOR_PWM_FREQ_HZ = 20000
+DEFAULT_MOTOR_PWM_FREQ_HZ = 1000
 MOTOR_DRIVE_MODE = "slow_decay"  # "slow_decay" is usually smoother on DRV8833.
 
 # Web server.
@@ -91,6 +91,7 @@ state = {
     "erase_freq_hz": DEFAULT_ERASE_FREQ_HZ,
     "motor_speed": 0,          # 0–255
     "motor_reverse": False,
+    "motor_pwm_freq_hz": DEFAULT_MOTOR_PWM_FREQ_HZ,
 }
 
 
@@ -135,6 +136,10 @@ def effective_motor_speed() -> int:
 
     state["motor_speed"] = speed
     return speed
+
+
+def normalize_motor_pwm_freq(freq_hz) -> int:
+    return int(clamp(int(freq_hz), 50, 20000))
 
 
 def enable_level(on: bool) -> int:
@@ -619,7 +624,8 @@ def apply_motor():
 
     debug(
         f"Apply motor: speed={speed}/255, duty={duty:.1f}%, "
-        f"reverse={reverse}, drive={MOTOR_DRIVE_MODE}"
+        f"reverse={reverse}, drive={MOTOR_DRIVE_MODE}, "
+        f"freq={state['motor_pwm_freq_hz']} Hz"
     )
 
     if speed == 0:
@@ -639,18 +645,18 @@ def apply_motor():
 
         if reverse:
             write(MOTOR_IN4, 1)
-            start_pwm(MOTOR_IN3, MOTOR_PWM_FREQ_HZ, brake_duty)
+            start_pwm(MOTOR_IN3, state["motor_pwm_freq_hz"], brake_duty)
         else:
             write(MOTOR_IN3, 1)
-            start_pwm(MOTOR_IN4, MOTOR_PWM_FREQ_HZ, brake_duty)
+            start_pwm(MOTOR_IN4, state["motor_pwm_freq_hz"], brake_duty)
 
     else:
         if reverse:
             write(MOTOR_IN3, 0)
-            start_pwm(MOTOR_IN4, MOTOR_PWM_FREQ_HZ, duty)
+            start_pwm(MOTOR_IN4, state["motor_pwm_freq_hz"], duty)
         else:
             write(MOTOR_IN4, 0)
-            start_pwm(MOTOR_IN3, MOTOR_PWM_FREQ_HZ, duty)
+            start_pwm(MOTOR_IN3, state["motor_pwm_freq_hz"], duty)
 
     motor_output_reverse = reverse
 
@@ -1027,12 +1033,16 @@ def route_motor():
 
     speed = request.values.get("speed")
     reverse = request.values.get("reverse")
+    freq = request.values.get("freq", request.values.get("hz"))
 
     if speed is not None:
         state["motor_speed"] = normalize_motor_speed(speed)
 
     if reverse is not None:
         state["motor_reverse"] = reverse.lower() in ["1", "true", "yes", "on"]
+
+    if freq is not None:
+        state["motor_pwm_freq_hz"] = normalize_motor_pwm_freq(freq)
 
     apply_motor()
     return jsonify(state)
