@@ -32,7 +32,13 @@ fi
 
 hash -r 2>/dev/null || true
 
-"$_setup_pi_dir/install_pi_system_deps.sh" || return 1 2>/dev/null || exit 1
+sudo apt-get update || return 1 2>/dev/null || exit 1
+sudo apt-get install -y python3-venv python3-lgpio alsa-utils ffmpeg || return 1 2>/dev/null || exit 1
+
+/usr/bin/python3 - <<'PY' || return 1 2>/dev/null || exit 1
+import lgpio
+print("System lgpio OK:", getattr(lgpio, "__file__", "built-in"))
+PY
 
 if [ -f "$_setup_pi_dir/.venv/pyvenv.cfg" ] && ! grep -q "^include-system-site-packages = true" "$_setup_pi_dir/.venv/pyvenv.cfg"; then
     echo "Recreating .venv with system site packages enabled"
