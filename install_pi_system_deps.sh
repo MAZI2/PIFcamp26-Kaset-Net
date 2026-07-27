@@ -7,9 +7,9 @@ if ! command -v apt-get >/dev/null 2>&1; then
 fi
 
 sudo apt-get update
-sudo apt-get install -y python3-lgpio alsa-utils ffmpeg
+sudo apt-get install -y python3-venv python3-lgpio alsa-utils ffmpeg
 
-python3 - <<'PY'
+/usr/bin/python3 - <<'PY'
 import lgpio
 print("lgpio OK:", getattr(lgpio, "__file__", "built-in"))
 PY

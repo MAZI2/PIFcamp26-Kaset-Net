@@ -19,7 +19,16 @@ _setup_venv_main() {
     _venv_dir="$_project_dir/.venv"
     _requirements_file="$_project_dir/requirements.txt"
     _marker_file="$_venv_dir/.requirements.sha256"
-    _python_bin="${PYTHON_BIN:-python3}"
+
+    hash -r 2>/dev/null || true
+
+    if [ -n "${PYTHON_BIN:-}" ]; then
+        _python_bin="$PYTHON_BIN"
+    elif [ -x /usr/bin/python3 ]; then
+        _python_bin="/usr/bin/python3"
+    else
+        _python_bin="python3"
+    fi
 
     if [ ! -f "$_requirements_file" ]; then
         echo "setup_venv.sh: requirements.txt not found in $_project_dir" >&2
@@ -28,11 +37,18 @@ _setup_venv_main() {
 
     if [ ! -d "$_venv_dir" ]; then
         echo "Creating .venv with system site packages"
+        echo "Using Python: $_python_bin"
         "$_python_bin" -m venv --system-site-packages "$_venv_dir" || return 1
     elif [ -f "$_venv_dir/pyvenv.cfg" ] && ! grep -q "^include-system-site-packages = true" "$_venv_dir/pyvenv.cfg"; then
         echo "setup_venv.sh: existing .venv does not include system site packages." >&2
         echo "This is needed for apt-installed Raspberry Pi modules such as lgpio." >&2
         echo "Run: rm -rf .venv && source ./setup_venv.sh" >&2
+        return 1
+    fi
+
+    if [ ! -x "$_venv_dir/bin/python" ]; then
+        echo "setup_venv.sh: $_venv_dir/bin/python was not created." >&2
+        echo "On Raspberry Pi OS, install venv support with: sudo apt-get install -y python3-venv" >&2
         return 1
     fi
 
