@@ -27,8 +27,13 @@ _setup_venv_main() {
     fi
 
     if [ ! -d "$_venv_dir" ]; then
-        echo "Creating .venv"
-        "$_python_bin" -m venv "$_venv_dir" || return 1
+        echo "Creating .venv with system site packages"
+        "$_python_bin" -m venv --system-site-packages "$_venv_dir" || return 1
+    elif [ -f "$_venv_dir/pyvenv.cfg" ] && ! grep -q "^include-system-site-packages = true" "$_venv_dir/pyvenv.cfg"; then
+        echo "setup_venv.sh: existing .venv does not include system site packages." >&2
+        echo "This is needed for apt-installed Raspberry Pi modules such as lgpio." >&2
+        echo "Run: rm -rf .venv && source ./setup_venv.sh" >&2
+        return 1
     fi
 
     _requirements_hash="$("$_venv_dir/bin/python" -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$_requirements_file")" || return 1

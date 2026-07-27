@@ -8,3 +8,8 @@ fi
 
 sudo apt-get update
 sudo apt-get install -y python3-lgpio alsa-utils ffmpeg
+
+python3 - <<'PY'
+import lgpio
+print("lgpio OK:", getattr(lgpio, "__file__", "built-in"))
+PY
