@@ -1,0 +1,4 @@
+192.168.90.44
+
+sudo arp-scan --localnet | grep -Ei 'Raspberry|Pi Trading'
+sudo nmap -p 22 --open 192.168.90.0/24
