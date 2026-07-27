@@ -90,14 +90,14 @@ class RecorderGUI:
         self.audio_device = tk.StringVar(value="auto")
 
         self.motor_speed = tk.IntVar(value=MIN_MOTOR_SPEED)
-        self.zeroconf = Zeroconf()
-        self.listener = RecorderDiscovery(self.event_queue)
-        self.browser = ServiceBrowser(self.zeroconf, SERVICE_TYPE, self.listener)
+        self.zeroconf = None
+        self.listener = None
+        self.browser = None
 
         self.build_ui()
 
         self.log("[INIT] GUI started")
-        self.log(f"[INIT] Browsing for mDNS service: {SERVICE_TYPE}")
+        self.log("[INIT] Add recorders manually, or press Find to browse with mDNS.")
 
         self.root.after(100, self.process_events)
 
@@ -134,6 +134,12 @@ class RecorderGUI:
 
         ttk.Button(
             discovery_frame,
+            text="Find",
+            command=self.start_discovery,
+        ).pack(side=tk.LEFT, padx=3)
+
+        ttk.Button(
+            discovery_frame,
             text="Select All",
             command=self.select_all_devices,
         ).pack(side=tk.LEFT, padx=3)
@@ -142,12 +148,6 @@ class RecorderGUI:
             discovery_frame,
             text="Status All",
             command=self.status,
-        ).pack(side=tk.LEFT, padx=3)
-
-        ttk.Button(
-            discovery_frame,
-            text="Refresh Log",
-            command=lambda: self.log("[INFO] Discovery is continuous; wait a few seconds or use manual URL."),
         ).pack(side=tk.LEFT, padx=3)
 
         # Manual host
@@ -202,10 +202,10 @@ class RecorderGUI:
             orient=tk.HORIZONTAL,
             command=self.on_speed_slider,
         )
+        self.speed_label = ttk.Label(motor_frame, text=str(self.motor_speed.get()), width=4)
+
         self.speed_slider.set(self.motor_speed.get())
         self.speed_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
-
-        self.speed_label = ttk.Label(motor_frame, text=str(self.motor_speed.get()), width=4)
         self.speed_label.pack(side=tk.LEFT, padx=3)
 
         ttk.Button(motor_frame, text="Apply Speed", command=self.apply_motor_speed).pack(side=tk.LEFT, padx=3)
@@ -278,6 +278,16 @@ class RecorderGUI:
 
     def clear_log(self):
         self.log_box.delete("1.0", tk.END)
+
+    def start_discovery(self):
+        if self.browser is not None:
+            self.log("[DISCOVERY] Already browsing")
+            return
+
+        self.log(f"[DISCOVERY] Browsing for mDNS service: {SERVICE_TYPE}")
+        self.zeroconf = Zeroconf()
+        self.listener = RecorderDiscovery(self.event_queue)
+        self.browser = ServiceBrowser(self.zeroconf, SERVICE_TYPE, self.listener)
 
     def process_events(self):
         try:
@@ -516,7 +526,9 @@ class RecorderGUI:
     def on_speed_slider(self, value):
         speed = max(MIN_MOTOR_SPEED, int(float(value)))
         self.motor_speed.set(speed)
-        self.speed_label.config(text=str(speed))
+
+        if hasattr(self, "speed_label"):
+            self.speed_label.config(text=str(speed))
 
     def apply_motor_speed(self):
         speed = self.motor_speed.get()
@@ -620,12 +632,13 @@ class RecorderGUI:
         self.command(path)
 
     def quit(self):
-        self.log("[QUIT] Closing Zeroconf")
+        self.log("[QUIT] Closing")
 
-        try:
-            self.zeroconf.close()
-        except Exception:
-            pass
+        if self.zeroconf is not None:
+            try:
+                self.zeroconf.close()
+            except Exception:
+                pass
 
         self.stop_audio_monitor(quiet=True)
 

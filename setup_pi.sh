@@ -45,7 +45,16 @@ if [ -f "$_setup_pi_dir/.venv/pyvenv.cfg" ] && ! grep -q "^include-system-site-p
     rm -rf "$_setup_pi_dir/.venv"
 fi
 
+_setup_pi_previous_python_bin="${PYTHON_BIN-}"
+PYTHON_BIN=/usr/bin/python3
 . "$_setup_pi_dir/setup_venv.sh" || return 1 2>/dev/null || exit 1
+
+if [ -n "$_setup_pi_previous_python_bin" ]; then
+    PYTHON_BIN="$_setup_pi_previous_python_bin"
+else
+    unset PYTHON_BIN
+fi
+unset _setup_pi_previous_python_bin
 
 python - <<'PY' || return 1 2>/dev/null || exit 1
 import flask
