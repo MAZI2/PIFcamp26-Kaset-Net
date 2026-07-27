@@ -55,6 +55,7 @@ ERASE_DUTY_PERCENT = 45
 MIN_MOTOR_SPEED = 180
 DEFAULT_MOTOR_SPEED = MIN_MOTOR_SPEED
 MOTOR_PWM_FREQ_HZ = 20000
+MOTOR_DRIVE_MODE = "slow_decay"  # "slow_decay" is usually smoother on DRV8833.
 
 # Web server.
 HTTP_PORT = 5000
@@ -174,12 +175,12 @@ def start_pwm(pin: int, freq_hz, duty_percent, offset_us=0):
     freq_hz = float(freq_hz)
     duty_percent = float(clamp(duty_percent, 0, 100))
 
+    stop_waveform(pin)
+
     if freq_hz <= 0 or duty_percent <= 0:
-        stop_waveform(pin)
         return
 
     if duty_percent >= 100:
-        stop_waveform(pin)
         write(pin, 1)
         return
 
@@ -618,7 +619,7 @@ def apply_motor():
 
     debug(
         f"Apply motor: speed={speed}/255, duty={duty:.1f}%, "
-        f"reverse={reverse}"
+        f"reverse={reverse}, drive={MOTOR_DRIVE_MODE}"
     )
 
     if speed == 0:
@@ -633,12 +634,23 @@ def apply_motor():
         stop_waveform(MOTOR_IN4)
         time.sleep(0.02)
 
-    if reverse:
-        write(MOTOR_IN3, 0)
-        start_pwm(MOTOR_IN4, MOTOR_PWM_FREQ_HZ, duty)
+    if MOTOR_DRIVE_MODE == "slow_decay":
+        brake_duty = 100.0 - duty
+
+        if reverse:
+            write(MOTOR_IN4, 1)
+            start_pwm(MOTOR_IN3, MOTOR_PWM_FREQ_HZ, brake_duty)
+        else:
+            write(MOTOR_IN3, 1)
+            start_pwm(MOTOR_IN4, MOTOR_PWM_FREQ_HZ, brake_duty)
+
     else:
-        write(MOTOR_IN4, 0)
-        start_pwm(MOTOR_IN3, MOTOR_PWM_FREQ_HZ, duty)
+        if reverse:
+            write(MOTOR_IN3, 0)
+            start_pwm(MOTOR_IN4, MOTOR_PWM_FREQ_HZ, duty)
+        else:
+            write(MOTOR_IN4, 0)
+            start_pwm(MOTOR_IN3, MOTOR_PWM_FREQ_HZ, duty)
 
     motor_output_reverse = reverse
 
