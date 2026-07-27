@@ -1,0 +1,83 @@
+# Remove accidentally tracked generated files safely
+
+Use the first section for normal cleanup. It keeps local files and only stops
+tracking them from this commit forward.
+
+Avoid history rewriting unless you really need the files removed from old
+commits too. History rewriting changes commit IDs and requires force pushing.
+
+
+## Safe cleanup: stop tracking, keep local files
+
+This is the right command for `.venv`, `__pycache__`, build folders, logs, etc.
+
+```sh
+git rm -r --cached .venv __pycache__
+printf "\n.venv/\n__pycache__/\n*.pyc\n" >> .gitignore
+git add .gitignore
+git commit -m "stop tracking generated files"
+git push origin main
+```
+
+`--cached` means "remove from Git index only". The local files remain on disk.
+
+
+## History rewrite: only if old commits must be cleaned too
+
+Do this only after the safe cleanup is committed and pushed. Make a fresh clone
+or a full backup first. Do not run this with an empty target.
+
+```sh
+TARGET=".venv"
+
+if [ -z "$TARGET" ]; then
+  echo "TARGET is empty; aborting" >&2
+  exit 1
+fi
+
+if [ ! -e "$TARGET" ]; then
+  echo "TARGET does not exist locally; aborting: $TARGET" >&2
+  exit 1
+fi
+
+BACKUP="../$(basename "$TARGET").backup.$(date +%Y%m%d-%H%M%S)"
+cp -a "$TARGET" "$BACKUP"
+
+git filter-repo --path "$TARGET" --invert-paths --force
+
+mkdir -p "$(dirname "$TARGET")"
+cp -a "$BACKUP" "$TARGET"
+
+# git-filter-repo removes origin as a safety measure. Re-add it manually.
+git remote add origin https://github.com/MAZI2/PIFcamp26-Kaset-Net.git
+git fetch origin
+
+# Inspect before pushing.
+git status
+git log --oneline -- "$TARGET"
+
+# Push only after you are sure.
+git push --force-with-lease origin main
+```
+
+
+## History rewrite for every __pycache__ folder
+
+```sh
+git filter-repo \
+  --path-glob '*/__pycache__/*' \
+  --path-glob '__pycache__/*' \
+  --invert-paths \
+  --force
+
+printf "\n__pycache__/\n*.pyc\n" >> .gitignore
+git add .gitignore
+git commit -m "ignore Python cache files"
+```
+
+Inspect before force pushing:
+
+```sh
+git status
+git log --all -- '**/__pycache__/*'
+```

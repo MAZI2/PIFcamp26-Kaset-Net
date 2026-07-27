@@ -1,0 +1,6 @@
+# Python packages used by the GUI/server.
+# Raspberry Pi GPIO comes from the system package python3-lgpio.
+# Audio tools come from alsa-utils and ffmpeg/ffplay.
+Flask
+requests
+zeroconf
