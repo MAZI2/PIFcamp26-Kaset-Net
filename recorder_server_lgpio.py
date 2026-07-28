@@ -87,6 +87,7 @@ zeroconf = None
 service_info = None
 motor_output_reverse = None
 cd4053_watchdog_stop = threading.Event()
+mic_sw_driven = False
 
 state = {
     "recorder_enabled": False,
@@ -177,6 +178,25 @@ def write(pin: int, level: int):
     lgpio.gpio_write(h, pin, 1 if level else 0)
 
 
+def set_mic_sw(level: int):
+    global mic_sw_driven
+
+    level = 1 if level else 0
+
+    if not mic_sw_driven:
+        lgpio.gpio_claim_output(h, MIC_SW, level)
+        mic_sw_driven = True
+    else:
+        write(MIC_SW, level)
+
+
+def release_mic_sw():
+    global mic_sw_driven
+
+    lgpio.gpio_claim_input(h, MIC_SW)
+    mic_sw_driven = False
+
+
 def stop_waveform(pin: int):
     try:
         lgpio.tx_pulse(h, pin, 0, 0)
@@ -218,7 +238,6 @@ def claim_outputs():
     pins = [
         (RECORDER_EN, enable_level(False)),
         (AMP_ON, 0),
-        (MIC_SW, 0),
         (CD4053_PWR, 1),
         (ERASE_IN1, 0),
         (ERASE_IN2, 0),
@@ -229,6 +248,9 @@ def claim_outputs():
     for pin, initial_level in pins:
         lgpio.gpio_claim_output(h, pin, initial_level)
         debug(f"Claimed GPIO {pin} as output, initial={initial_level}")
+
+    release_mic_sw()
+    debug(f"Claimed GPIO {MIC_SW} as input/high-Z")
 
 
 # ============================================================
@@ -499,8 +521,8 @@ def update_amp_mute():
 
 
 def set_cd4053_playback_off():
-    debug("CD4053: playback, control pin low")
-    write(MIC_SW, 0)
+    debug("CD4053: playback, control pin high-Z")
+    release_mic_sw()
 
     debug("CD4053: playback, power off")
     cd4053_power(False)
@@ -513,17 +535,17 @@ def set_cd4053_play_path():
     time.sleep(0.05)
 
     debug("CD4053: playback path selected")
-    write(MIC_SW, 1)
+    set_mic_sw(1)
     time.sleep(0.05)
 
 
 def hold_cd4053_playback_state():
     if CD4053_OFF_DURING_PLAYBACK:
-        write(MIC_SW, 0)
+        release_mic_sw()
         cd4053_power(False)
     else:
         cd4053_power(True)
-        write(MIC_SW, 1)
+        set_mic_sw(1)
 
 
 def cd4053_playback_watchdog():
@@ -555,7 +577,7 @@ def set_cd4053_record_path():
     time.sleep(0.05)
 
     debug("CD4053: record path selected")
-    write(MIC_SW, 0)
+    set_mic_sw(0)
     time.sleep(0.05)
 
 
@@ -570,7 +592,7 @@ def set_recorder_power(on: bool):
         state["motor_speed"] = 0
         apply_motor()
         write(AMP_ON, 0)
-        write(MIC_SW, 0)
+        release_mic_sw()
         cd4053_power(False)
 
 
@@ -743,7 +765,7 @@ def setup():
     stop_erase_outputs()
 
     write(AMP_ON, 0)
-    write(MIC_SW, 0)
+    release_mic_sw()
     cd4053_power(False)
 
     stop_waveform(MOTOR_IN3)
@@ -774,7 +796,7 @@ def cleanup():
 
     try:
         write(AMP_ON, 0)
-        write(MIC_SW, 0)
+        release_mic_sw()
         cd4053_power(False)
         write(RECORDER_EN, enable_level(False))
     except Exception:
