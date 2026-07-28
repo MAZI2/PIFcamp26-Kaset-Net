@@ -57,7 +57,7 @@ MIN_MOTOR_SPEED = 0
 DEFAULT_MOTOR_SPEED = 180
 DEFAULT_MOTOR_PWM_FREQ_HZ = 1000
 MOTOR_DRIVE_MODE = "slow_decay"  # "slow_decay" is usually smoother on DRV8833.
-CD4053_OFF_DURING_PLAYBACK = False
+CD4053_OFF_DURING_PLAYBACK = True
 CD4053_PLAYBACK_HOLD_INTERVAL = 1.0
 
 # Web server.
@@ -517,9 +517,13 @@ def set_cd4053_play_path():
     time.sleep(0.05)
 
 
-def hold_cd4053_play_path():
-    cd4053_power(True)
-    write(MIC_SW, 1)
+def hold_cd4053_playback_state():
+    if CD4053_OFF_DURING_PLAYBACK:
+        write(MIC_SW, 0)
+        cd4053_power(False)
+    else:
+        cd4053_power(True)
+        write(MIC_SW, 1)
 
 
 def cd4053_playback_watchdog():
@@ -531,10 +535,9 @@ def cd4053_playback_watchdog():
             state["recorder_enabled"]
             and state["mode"] == "play"
             and not state["erase"]
-            and not CD4053_OFF_DURING_PLAYBACK
         ):
             try:
-                hold_cd4053_play_path()
+                hold_cd4053_playback_state()
             except Exception as e:
                 debug(f"CD4053 playback hold failed: {e}")
 
@@ -1009,7 +1012,10 @@ def route_debug_amp_off():
 @app.route("/debug/mic/play", methods=["GET", "POST"])
 def route_debug_mic_play():
     debug("HTTP /debug/mic/play")
-    set_cd4053_play_path()
+    if CD4053_OFF_DURING_PLAYBACK:
+        set_cd4053_playback_off()
+    else:
+        set_cd4053_play_path()
     apply_motor()
     return jsonify(state)
 
