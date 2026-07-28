@@ -5,6 +5,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
 
 from flask import Flask, Response, jsonify, request, stream_with_context
@@ -56,6 +57,8 @@ MIN_MOTOR_SPEED = 0
 DEFAULT_MOTOR_SPEED = 180
 DEFAULT_MOTOR_PWM_FREQ_HZ = 1000
 MOTOR_DRIVE_MODE = "slow_decay"  # "slow_decay" is usually smoother on DRV8833.
+CD4053_OFF_DURING_PLAYBACK = False
+CD4053_PLAYBACK_HOLD_INTERVAL = 1.0
 
 # Web server.
 HTTP_PORT = 5000
@@ -83,6 +86,7 @@ h = None
 zeroconf = None
 service_info = None
 motor_output_reverse = None
+cd4053_watchdog_stop = threading.Event()
 
 state = {
     "recorder_enabled": False,
@@ -503,6 +507,45 @@ def set_cd4053_playback_off():
     time.sleep(0.1)
 
 
+def set_cd4053_play_path():
+    debug("CD4053: power on for playback path")
+    cd4053_power(True)
+    time.sleep(0.05)
+
+    debug("CD4053: playback path selected")
+    write(MIC_SW, 1)
+    time.sleep(0.05)
+
+
+def hold_cd4053_play_path():
+    cd4053_power(True)
+    write(MIC_SW, 1)
+
+
+def cd4053_playback_watchdog():
+    while not cd4053_watchdog_stop.wait(CD4053_PLAYBACK_HOLD_INTERVAL):
+        if h is None:
+            continue
+
+        if (
+            state["recorder_enabled"]
+            and state["mode"] == "play"
+            and not state["erase"]
+            and not CD4053_OFF_DURING_PLAYBACK
+        ):
+            try:
+                hold_cd4053_play_path()
+            except Exception as e:
+                debug(f"CD4053 playback hold failed: {e}")
+
+
+def start_cd4053_watchdog():
+    cd4053_watchdog_stop.clear()
+    thread = threading.Thread(target=cd4053_playback_watchdog, daemon=True)
+    thread.start()
+    debug("CD4053 playback watchdog started")
+
+
 def set_cd4053_record_path():
     debug("CD4053: power on for record-path switch")
     cd4053_power(True)
@@ -598,7 +641,11 @@ def set_play():
     state["mode"] = "play"
 
     write(AMP_ON, 0)
-    set_cd4053_playback_off()
+
+    if CD4053_OFF_DURING_PLAYBACK:
+        set_cd4053_playback_off()
+    else:
+        set_cd4053_play_path()
 
     update_amp_mute()
 
@@ -702,12 +749,14 @@ def setup():
     set_recorder_power(True)
     time.sleep(0.2)
     set_play()
+    start_cd4053_watchdog()
 
     debug("GPIO setup complete")
 
 
 def cleanup():
     debug("Cleanup started")
+    cd4053_watchdog_stop.set()
 
     try:
         erase_off()
@@ -960,7 +1009,7 @@ def route_debug_amp_off():
 @app.route("/debug/mic/play", methods=["GET", "POST"])
 def route_debug_mic_play():
     debug("HTTP /debug/mic/play")
-    set_cd4053_playback_off()
+    set_cd4053_play_path()
     apply_motor()
     return jsonify(state)
 
