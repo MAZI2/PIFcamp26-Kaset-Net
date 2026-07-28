@@ -88,6 +88,7 @@ service_info = None
 motor_output_reverse = None
 cd4053_watchdog_stop = threading.Event()
 mic_sw_driven = False
+cd4053_pwr_driven = False
 
 state = {
     "recorder_enabled": False,
@@ -155,8 +156,19 @@ def enable_level(on: bool) -> int:
 
 
 def cd4053_power(on: bool):
+    global cd4053_pwr_driven
+
     state["cd4053_powered"] = bool(on)
-    write(CD4053_PWR, 0 if on else 1)
+
+    if on:
+        if not cd4053_pwr_driven:
+            lgpio.gpio_claim_output(h, CD4053_PWR, 0)
+            cd4053_pwr_driven = True
+        else:
+            write(CD4053_PWR, 0)
+    else:
+        lgpio.gpio_claim_input(h, CD4053_PWR)
+        cd4053_pwr_driven = False
 
 
 def open_gpiochip():
@@ -238,7 +250,6 @@ def claim_outputs():
     pins = [
         (RECORDER_EN, enable_level(False)),
         (AMP_ON, 0),
-        (CD4053_PWR, 1),
         (ERASE_IN1, 0),
         (ERASE_IN2, 0),
         (MOTOR_IN3, 0),
@@ -251,6 +262,8 @@ def claim_outputs():
 
     release_mic_sw()
     debug(f"Claimed GPIO {MIC_SW} as input/high-Z")
+    cd4053_power(False)
+    debug(f"Claimed GPIO {CD4053_PWR} as input/high-Z")
 
 
 # ============================================================
@@ -861,6 +874,9 @@ def index():
     <p><a href="/debug/amp/off">Debug amp OFF</a></p>
     <p><a href="/debug/mic/play">Debug mic PLAY path</a></p>
     <p><a href="/debug/mic/record">Debug mic RECORD path</a></p>
+    <p><a href="/debug/mic/high">Debug MIC_SW HIGH</a></p>
+    <p><a href="/debug/mic/low">Debug MIC_SW LOW</a></p>
+    <p><a href="/debug/mic/release">Debug MIC_SW high-Z</a></p>
     <p><a href="/debug/cd4053/on">Debug CD4053 power ON</a></p>
     <p><a href="/debug/cd4053/off">Debug CD4053 power OFF</a></p>
     """
@@ -1050,6 +1066,30 @@ def route_debug_mic_record():
     return jsonify(state)
 
 
+@app.route("/debug/mic/high", methods=["GET", "POST"])
+def route_debug_mic_high():
+    debug("HTTP /debug/mic/high")
+    set_mic_sw(1)
+    apply_motor()
+    return jsonify(state)
+
+
+@app.route("/debug/mic/low", methods=["GET", "POST"])
+def route_debug_mic_low():
+    debug("HTTP /debug/mic/low")
+    set_mic_sw(0)
+    apply_motor()
+    return jsonify(state)
+
+
+@app.route("/debug/mic/release", methods=["GET", "POST"])
+def route_debug_mic_release():
+    debug("HTTP /debug/mic/release")
+    release_mic_sw()
+    apply_motor()
+    return jsonify(state)
+
+
 @app.route("/debug/cd4053/on", methods=["GET", "POST"])
 def route_debug_cd4053_on():
     debug("HTTP /debug/cd4053/on")
@@ -1061,6 +1101,7 @@ def route_debug_cd4053_on():
 @app.route("/debug/cd4053/off", methods=["GET", "POST"])
 def route_debug_cd4053_off():
     debug("HTTP /debug/cd4053/off")
+    release_mic_sw()
     cd4053_power(False)
     apply_motor()
     return jsonify(state)
