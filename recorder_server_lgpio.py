@@ -155,7 +155,23 @@ def cd4053_power(on: bool):
     if on:
         lgpio.gpio_claim_output(h, CD4053_PWR, 1)
     else:
+        release_cd4053_power()
+
+
+def release_cd4053_power():
+    try:
+        pull_none = getattr(lgpio, "SET_PULL_NONE", 0)
+        lgpio.gpio_claim_input(h, CD4053_PWR, pull_none)
+    except TypeError:
         lgpio.gpio_claim_input(h, CD4053_PWR)
+
+    gpio_free = getattr(lgpio, "gpio_free", None)
+
+    if gpio_free:
+        try:
+            gpio_free(h, CD4053_PWR)
+        except Exception as e:
+            debug(f"GPIO {CD4053_PWR} free ignored: {e}")
 
 
 def open_gpiochip():
