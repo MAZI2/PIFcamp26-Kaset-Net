@@ -17,7 +17,7 @@ from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 
 
 SERVICE_TYPE = "_recorder._tcp.local."
-MIN_MOTOR_SPEED = 180
+MIN_MOTOR_SPEED = 0
 ERASE_FREQ_OPTIONS = ("20000", "30000", "40000", "50000")
 RECORD_PATH = "/record"
 REQUEST_TIMEOUT = 3.0

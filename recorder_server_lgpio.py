@@ -52,8 +52,8 @@ DEFAULT_ERASE_FREQ_HZ = 20000
 ERASE_DUTY_PERCENT = 45
 
 # Motor PWM.
-MIN_MOTOR_SPEED = 180
-DEFAULT_MOTOR_SPEED = MIN_MOTOR_SPEED
+MIN_MOTOR_SPEED = 0
+DEFAULT_MOTOR_SPEED = 180
 DEFAULT_MOTOR_PWM_FREQ_HZ = 1000
 MOTOR_DRIVE_MODE = "slow_decay"  # "slow_decay" is usually smoother on DRV8833.
 
@@ -214,7 +214,7 @@ def claim_outputs():
     pins = [
         (RECORDER_EN, enable_level(False)),
         (AMP_ON, 0),
-        (MIC_SW, 1),
+        (MIC_SW, 0),
         (CD4053_PWR, 1),
         (ERASE_IN1, 0),
         (ERASE_IN2, 0),
@@ -494,17 +494,13 @@ def update_amp_mute():
         write(AMP_ON, 1)
 
 
-def set_cd4053_play_path():
-    debug("CD4053: power on for play-path switch")
-    cd4053_power(True)
-    time.sleep(0.05)
+def set_cd4053_playback_off():
+    debug("CD4053: playback, control pin low")
+    write(MIC_SW, 0)
 
-    debug("CD4053: playback path selected")
-    write(MIC_SW, 1)
-    time.sleep(0.05)
-
-    debug("CD4053: power off after playback switch")
+    debug("CD4053: playback, power off")
     cd4053_power(False)
+    time.sleep(0.1)
 
 
 def set_cd4053_record_path():
@@ -528,7 +524,7 @@ def set_recorder_power(on: bool):
         state["motor_speed"] = 0
         apply_motor()
         write(AMP_ON, 0)
-        write(MIC_SW, 1)
+        write(MIC_SW, 0)
         cd4053_power(False)
 
 
@@ -601,7 +597,8 @@ def set_play():
 
     state["mode"] = "play"
 
-    set_cd4053_play_path()
+    write(AMP_ON, 0)
+    set_cd4053_playback_off()
 
     update_amp_mute()
 
@@ -696,7 +693,7 @@ def setup():
     stop_erase_outputs()
 
     write(AMP_ON, 0)
-    write(MIC_SW, 1)
+    write(MIC_SW, 0)
     cd4053_power(False)
 
     stop_waveform(MOTOR_IN3)
@@ -725,7 +722,7 @@ def cleanup():
 
     try:
         write(AMP_ON, 0)
-        write(MIC_SW, 1)
+        write(MIC_SW, 0)
         cd4053_power(False)
         write(RECORDER_EN, enable_level(False))
     except Exception:
@@ -963,7 +960,7 @@ def route_debug_amp_off():
 @app.route("/debug/mic/play", methods=["GET", "POST"])
 def route_debug_mic_play():
     debug("HTTP /debug/mic/play")
-    set_cd4053_play_path()
+    set_cd4053_playback_off()
     apply_motor()
     return jsonify(state)
 

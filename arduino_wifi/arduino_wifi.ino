@@ -18,8 +18,8 @@ const int ERASE_IN2  = 6;   // DRV8833 erase channel IN2
 const int MOTOR_IN3  = 9;   // DRV8833 motor channel IN3
 const int MOTOR_IN4  = 10;  // DRV8833 motor channel IN4
 
-const int MIN_MOTOR_SPEED = 180;
-const int DEFAULT_MOTOR_SPEED = MIN_MOTOR_SPEED;
+const int MIN_MOTOR_SPEED = 0;
+const int DEFAULT_MOTOR_SPEED = 180;
 const int DEFAULT_ERASE_FREQ_HZ = 20000;
 const unsigned long SERIAL_WAIT_MS = 3000;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
