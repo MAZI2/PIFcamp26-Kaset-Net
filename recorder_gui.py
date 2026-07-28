@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 
+import array
 import json
+import math
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
@@ -15,8 +18,18 @@ from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 
 SERVICE_TYPE = "_recorder._tcp.local."
 MIN_MOTOR_SPEED = 180
+ERASE_FREQ_OPTIONS = ("20000", "30000", "40000", "50000")
 RECORD_PATH = "/record?led=0"
 REQUEST_TIMEOUT = 3.0
+AUDIO_RATE = 44100
+AUDIO_CHANNELS = 1
+AUDIO_CHUNK_BYTES = 4096
+AUDIO_SOURCE_BUFFER_MAX_BYTES = AUDIO_RATE * AUDIO_CHANNELS * 2
+AUDIO_LEVEL_DOTS = 12
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
 
 # ============================================================
@@ -83,27 +96,54 @@ class RecorderGUI:
 
         self.event_queue = queue.Queue()
         self.devices = {}
-        self.audio_process = None
-        self.audio_starting = False
+        self.mixer_running = False
+        self.mixer_process = None
+        self.mixer_stop_event = threading.Event()
+        self.mixer_thread = None
+        self.mixer_sources = {}
+        self.mixer_rows = {}
+        self.mixer_lock = threading.Lock()
 
         self.manual_host = tk.StringVar(value="192.168.0.9")
         self.audio_device = tk.StringVar(value="auto")
+        self.erase_freq = tk.StringVar(value=ERASE_FREQ_OPTIONS[0])
 
         self.motor_speed = tk.IntVar(value=MIN_MOTOR_SPEED)
         self.zeroconf = None
         self.listener = None
         self.browser = None
 
+        self.configure_style()
         self.build_ui()
 
         self.log("[INIT] GUI started")
         self.log("[INIT] Add recorders manually, or press Find to browse with mDNS.")
 
         self.root.after(100, self.process_events)
+        self.root.after(100, self.update_mixer_meters)
 
     # --------------------------------------------------------
     # UI
     # --------------------------------------------------------
+
+    def configure_style(self):
+        self.root.configure(bg="white")
+
+        style = ttk.Style(self.root)
+
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure(".", background="white", foreground="#111111")
+        style.configure("TFrame", background="white")
+        style.configure("TLabelframe", background="white")
+        style.configure("TLabelframe.Label", background="white", foreground="#111111")
+        style.configure("TLabel", background="white", foreground="#111111")
+        style.configure("TCheckbutton", background="white", foreground="#111111")
+        style.configure("TButton", padding=(8, 4))
+        style.configure("Horizontal.TScale", background="white")
 
     def build_ui(self):
         main = ttk.Frame(self.root, padding=10)
@@ -121,6 +161,13 @@ class RecorderGUI:
             selectmode=tk.EXTENDED,
             height=5,
             exportselection=False,
+            bg="white",
+            fg="#111111",
+            selectbackground="#dcecff",
+            selectforeground="#111111",
+            highlightthickness=1,
+            highlightbackground="#d7d7d7",
+            relief=tk.FLAT,
         )
         self.device_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -146,7 +193,7 @@ class RecorderGUI:
 
         ttk.Button(
             discovery_frame,
-            text="Status All",
+            text="Status Selected",
             command=self.status,
         ).pack(side=tk.LEFT, padx=3)
 
@@ -186,6 +233,16 @@ class RecorderGUI:
         erase_frame = ttk.LabelFrame(main, text="Erase", padding=10)
         erase_frame.pack(fill=tk.X, pady=(10, 0))
 
+        ttk.Label(erase_frame, text="Freq:").pack(side=tk.LEFT, padx=3)
+
+        ttk.Combobox(
+            erase_frame,
+            textvariable=self.erase_freq,
+            values=ERASE_FREQ_OPTIONS,
+            width=8,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=3)
+
         ttk.Button(erase_frame, text="Erase ON", command=self.erase_on).pack(side=tk.LEFT, padx=3)
         ttk.Button(erase_frame, text="Erase OFF", command=lambda: self.command("/erase/off")).pack(side=tk.LEFT, padx=3)
 
@@ -220,21 +277,27 @@ class RecorderGUI:
         ttk.Button(direction_frame, text="Forward + Speed", command=self.motor_forward).pack(side=tk.LEFT, padx=3)
         ttk.Button(direction_frame, text="Reverse + Speed", command=self.motor_reverse).pack(side=tk.LEFT, padx=3)
 
-        # Audio monitor
-        audio_frame = ttk.LabelFrame(main, text="Audio monitor", padding=10)
+        # Audio mixer
+        audio_frame = ttk.LabelFrame(main, text="Audio mixer", padding=10)
         audio_frame.pack(fill=tk.X, pady=(10, 0))
 
-        ttk.Label(audio_frame, text="ALSA device:").pack(side=tk.LEFT, padx=3)
+        audio_controls = ttk.Frame(audio_frame)
+        audio_controls.pack(fill=tk.X)
+
+        ttk.Label(audio_controls, text="ALSA device:").pack(side=tk.LEFT, padx=3)
 
         ttk.Entry(
-            audio_frame,
+            audio_controls,
             textvariable=self.audio_device,
             width=16,
         ).pack(side=tk.LEFT, padx=3)
 
-        ttk.Button(audio_frame, text="Start Monitor", command=self.start_audio_monitor).pack(side=tk.LEFT, padx=3)
-        ttk.Button(audio_frame, text="Stop Monitor", command=self.stop_audio_monitor).pack(side=tk.LEFT, padx=3)
-        ttk.Button(audio_frame, text="List Devices", command=lambda: self.command("/audio/devices")).pack(side=tk.LEFT, padx=3)
+        ttk.Button(audio_controls, text="Start Mixer", command=self.start_audio_monitor).pack(side=tk.LEFT, padx=3)
+        ttk.Button(audio_controls, text="Stop Mixer", command=self.stop_audio_monitor).pack(side=tk.LEFT, padx=3)
+        ttk.Button(audio_controls, text="List Devices", command=lambda: self.command("/audio/devices")).pack(side=tk.LEFT, padx=3)
+
+        self.mixer_rows_frame = ttk.Frame(audio_frame)
+        self.mixer_rows_frame.pack(fill=tk.X, pady=(8, 0))
 
         # Quick command entry
         custom_frame = ttk.LabelFrame(main, text="Custom endpoint", padding=10)
@@ -258,7 +321,14 @@ class RecorderGUI:
         log_frame = ttk.LabelFrame(main, text="Debug log", padding=10)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
-        self.log_box = scrolledtext.ScrolledText(log_frame, height=22, wrap=tk.WORD)
+        self.log_box = scrolledtext.ScrolledText(
+            log_frame,
+            height=14,
+            wrap=tk.WORD,
+            bg="white",
+            fg="#111111",
+            insertbackground="#111111",
+        )
         self.log_box.pack(fill=tk.BOTH, expand=True)
 
         bottom = ttk.Frame(main)
@@ -298,12 +368,16 @@ class RecorderGUI:
                     self.log(payload)
 
                 elif event == "device_added":
+                    existing = self.devices.get(payload["url"], {})
+                    payload["transport_mode"] = existing.get("transport_mode", "play")
+                    payload["erase_active"] = existing.get("erase_active", False)
                     self.devices[payload["url"]] = payload
                     self.log(
                         f"[DISCOVERY] Found recorder: {payload['name']} "
                         f"at {payload['url']} props={payload['properties']}"
                     )
                     self.refresh_device_list()
+                    self.sync_mixer_sources()
 
                 elif event == "device_removed":
                     removed_urls = [
@@ -317,31 +391,17 @@ class RecorderGUI:
 
                     if removed_urls:
                         self.refresh_device_list()
+                        self.sync_mixer_sources()
 
-                elif event == "audio_started":
-                    proc, stream_url = payload
-                    self.audio_starting = False
+                elif event == "status_update":
+                    base_url, data = payload
+                    self.update_device_from_status(base_url, data)
 
-                    if proc.poll() is None:
-                        self.audio_process = proc
-                        self.log(f"[AUDIO] Monitor started: {stream_url}")
-                    else:
-                        self.audio_process = None
-                        self.log(f"[AUDIO] Monitor exited immediately with code {proc.returncode}")
+                elif event == "mixer_error":
+                    self.log(payload)
 
-                elif event == "audio_exited":
-                    proc, returncode, stderr = payload
-
-                    if self.audio_process is proc:
-                        self.audio_process = None
-                        self.log(f"[AUDIO] Monitor exited with code {returncode}")
-
-                        if stderr:
-                            self.log(f"[AUDIO] ffplay stderr:\n{stderr[-2000:]}")
-
-                elif event == "audio_error":
-                    self.audio_starting = False
-                    self.audio_process = None
+                elif event == "mixer_stopped":
+                    self.mixer_running = False
                     self.log(payload)
 
         except queue.Empty:
@@ -349,8 +409,14 @@ class RecorderGUI:
 
         self.root.after(100, self.process_events)
 
+    def displayed_device_state(self, dev):
+        if dev.get("erase_active"):
+            return "erase"
+
+        return dev.get("transport_mode", "play")
+
     def device_label(self, dev):
-        return f"{dev['url']}  |  {dev['name']}"
+        return f"{dev['url']}  |  {dev['name']}  |  state: {self.displayed_device_state(dev)}"
 
     def refresh_device_list(self):
         selected_urls = set(self.get_selected_base_urls(allow_empty=True))
@@ -372,6 +438,57 @@ class RecorderGUI:
     def select_all_devices(self):
         self.device_list.selection_set(0, tk.END)
         self.log(f"[TARGETS] Selected {len(self.device_list.curselection())} recorder(s)")
+
+    def update_device_state(self, base_url, transport_mode=None, erase_active=None):
+        dev = self.devices.get(base_url)
+
+        if not dev:
+            return
+
+        if transport_mode in ["play", "record"]:
+            dev["transport_mode"] = transport_mode
+
+        if erase_active is not None:
+            dev["erase_active"] = bool(erase_active)
+
+    def update_device_from_status(self, base_url, data):
+        if not isinstance(data, dict):
+            return
+
+        mode = data.get("mode")
+        erase = data.get("erase")
+
+        self.update_device_state(
+            base_url,
+            transport_mode=mode if mode in ["play", "record"] else None,
+            erase_active=erase if erase is not None else None,
+        )
+        self.refresh_device_list()
+        self.sync_mixer_sources()
+
+    def apply_command_state(self, base_urls, path):
+        command_path = urlsplit(path).path
+
+        transport_mode = None
+        erase_active = None
+
+        if command_path == "/play":
+            transport_mode = "play"
+        elif command_path == "/record":
+            transport_mode = "record"
+        elif command_path == "/erase/on":
+            erase_active = True
+        elif command_path == "/erase/off":
+            erase_active = False
+
+        if transport_mode is None and erase_active is None:
+            return
+
+        for base_url in base_urls:
+            self.update_device_state(base_url, transport_mode, erase_active)
+
+        self.refresh_device_list()
+        self.sync_mixer_sources()
 
     # --------------------------------------------------------
     # URL / REQUEST HELPERS
@@ -425,6 +542,8 @@ class RecorderGUI:
             "port": "",
             "url": url,
             "properties": {"source": "manual"},
+            "transport_mode": "play",
+            "erase_active": False,
         }
 
         self.devices[url] = dev
@@ -452,6 +571,8 @@ class RecorderGUI:
             self.log(f"[ERROR] {type(e).__name__}: {e}")
             return
 
+        self.apply_command_state(base_urls, path)
+
         thread = threading.Thread(
             target=self._request_group_worker,
             args=(path, base_urls),
@@ -468,8 +589,9 @@ class RecorderGUI:
     def build_url(self, path):
         return self.build_url_for(self.get_primary_base_url(), path)
 
-    def _request_one(self, url, start_event):
+    def _request_one(self, base_url, path, start_event):
         start_event.wait()
+        url = self.build_url_for(base_url, path)
 
         try:
             self.event_queue.put(("debug", f"[REQUEST] GET {url}"))
@@ -482,6 +604,7 @@ class RecorderGUI:
                 data = response.json()
                 pretty = json.dumps(data, indent=2, sort_keys=True)
                 self.event_queue.put(("debug", f"[JSON]\n{pretty}"))
+                self.event_queue.put(("status_update", (base_url, data)))
             except Exception:
                 text = response.text[:2000]
                 self.event_queue.put(("debug", f"[TEXT]\n{text}"))
@@ -496,10 +619,9 @@ class RecorderGUI:
         workers = []
 
         for base_url in base_urls:
-            url = self.build_url_for(base_url, path)
             worker = threading.Thread(
                 target=self._request_one,
-                args=(url, start_event),
+                args=(base_url, path, start_event),
                 daemon=True,
             )
             workers.append(worker)
@@ -521,7 +643,7 @@ class RecorderGUI:
         self.command("/status")
 
     def erase_on(self):
-        self.command("/erase/on?freq=20000")
+        self.command(f"/erase/on?freq={self.erase_freq.get()}")
 
     def on_speed_slider(self, value):
         speed = max(MIN_MOTOR_SPEED, int(float(value)))
@@ -542,90 +664,420 @@ class RecorderGUI:
         speed = self.motor_speed.get()
         self.command(f"/motor?speed={speed}&reverse=1")
 
-    def start_audio_monitor(self):
-        if self.audio_starting:
-            self.log("[AUDIO] Monitor is starting")
-            return
-
-        if self.audio_process and self.audio_process.poll() is None:
-            self.log("[AUDIO] Monitor already running")
-            return
-
-        ffplay = shutil.which("ffplay")
-
-        if not ffplay:
-            self.log("[AUDIO] ffplay not found. Install ffmpeg/ffplay on this computer.")
-            return
-
-        device = quote(self.audio_device.get().strip() or "default", safe="")
-        stream_url = self.build_url(f"/audio/stream?device={device}")
-
-        cmd = [
-            ffplay,
-            "-nodisp",
-            "-loglevel", "warning",
-            "-fflags", "nobuffer",
-            "-flags", "low_delay",
-            "-probesize", "32",
-            "-analyzeduration", "0",
-            "-f", "s16le",
-            "-ar", "44100",
-            "-ac", "1",
-            stream_url,
+    def playable_mixer_urls(self):
+        return [
+            url for url, dev in sorted(self.devices.items())
+            if self.displayed_device_state(dev) == "play"
         ]
 
-        self.audio_starting = True
-        self.log(f"[AUDIO] Starting monitor: {stream_url}")
+    def choose_playback_command(self):
+        aplay = shutil.which("aplay")
+        ffplay = shutil.which("ffplay")
+
+        if sys.platform.startswith("linux") and aplay:
+            return "aplay", [
+                aplay,
+                "-q",
+                "-t", "raw",
+                "-f", "S16_LE",
+                "-r", str(AUDIO_RATE),
+                "-c", str(AUDIO_CHANNELS),
+            ]
+
+        if ffplay:
+            return "ffplay", [
+                ffplay,
+                "-nodisp",
+                "-loglevel", "warning",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                "-probesize", "32",
+                "-analyzeduration", "0",
+                "-f", "s16le",
+                "-ar", str(AUDIO_RATE),
+                "-ac", str(AUDIO_CHANNELS),
+                "-i", "pipe:0",
+            ]
+
+        if aplay:
+            return "aplay", [
+                aplay,
+                "-q",
+                "-t", "raw",
+                "-f", "S16_LE",
+                "-r", str(AUDIO_RATE),
+                "-c", str(AUDIO_CHANNELS),
+            ]
+
+        raise RuntimeError("No audio player found. Install ffmpeg/ffplay on macOS or alsa-utils/aplay on Linux.")
+
+    def create_mixer_row(self, base_url, source):
+        row = ttk.Frame(self.mixer_rows_frame)
+        row.pack(fill=tk.X, pady=2)
+
+        ttk.Label(row, text=base_url, width=34).pack(side=tk.LEFT, padx=3)
+
+        canvas = tk.Canvas(
+            row,
+            width=112,
+            height=18,
+            bg="white",
+            highlightthickness=0,
+        )
+        canvas.pack(side=tk.LEFT, padx=8)
+
+        volume_var = tk.DoubleVar(value=source["volume"])
+        mute_var = tk.BooleanVar(value=source["mute"])
+
+        def on_volume(value, url=base_url):
+            with self.mixer_lock:
+                if url in self.mixer_sources:
+                    self.mixer_sources[url]["volume"] = float(value)
+
+        def on_mute(url=base_url, var=mute_var):
+            with self.mixer_lock:
+                if url in self.mixer_sources:
+                    self.mixer_sources[url]["mute"] = bool(var.get())
+
+        ttk.Scale(
+            row,
+            from_=0.0,
+            to=1.5,
+            orient=tk.HORIZONTAL,
+            variable=volume_var,
+            command=on_volume,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
+
+        ttk.Checkbutton(row, text="Mute", variable=mute_var, command=on_mute).pack(side=tk.LEFT, padx=3)
+
+        self.mixer_rows[base_url] = {
+            "row": row,
+            "canvas": canvas,
+            "volume_var": volume_var,
+            "mute_var": mute_var,
+        }
+
+    def start_mixer_source(self, base_url, source):
+        thread = source.get("thread")
+
+        if thread and thread.is_alive():
+            return
+
+        source["device"] = self.audio_device.get().strip() or "default"
+        source["stop_event"] = threading.Event()
+        source["queue"] = queue.Queue(maxsize=64)
+        source["buffer"] = bytearray()
 
         thread = threading.Thread(
-            target=self._start_audio_monitor_worker,
-            args=(cmd, stream_url),
+            target=self._audio_stream_worker,
+            args=(base_url, source),
             daemon=True,
         )
+        source["thread"] = thread
         thread.start()
 
-    def _start_audio_monitor_worker(self, cmd, stream_url):
+    def stop_mixer_source(self, source):
+        stop_event = source.get("stop_event")
+
+        if stop_event:
+            stop_event.set()
+
+        source["level"] = 0.0
+
+    def sync_mixer_sources(self):
+        if not hasattr(self, "mixer_rows_frame"):
+            return
+
+        playable_urls = set(self.playable_mixer_urls())
+
+        with self.mixer_lock:
+            for base_url in list(self.mixer_sources):
+                if base_url not in playable_urls:
+                    self.stop_mixer_source(self.mixer_sources[base_url])
+                    del self.mixer_sources[base_url]
+
+            for base_url in playable_urls:
+                if base_url not in self.mixer_sources:
+                    self.mixer_sources[base_url] = {
+                        "url": base_url,
+                        "queue": queue.Queue(maxsize=64),
+                        "buffer": bytearray(),
+                        "stop_event": threading.Event(),
+                        "thread": None,
+                        "volume": 1.0,
+                        "mute": False,
+                        "level": 0.0,
+                    }
+
+        for base_url in list(self.mixer_rows):
+            if base_url not in playable_urls:
+                self.mixer_rows[base_url]["row"].destroy()
+                del self.mixer_rows[base_url]
+
+        with self.mixer_lock:
+            current_sources = list(self.mixer_sources.items())
+
+        for base_url, source in current_sources:
+            if base_url not in self.mixer_rows:
+                self.create_mixer_row(base_url, source)
+
+            if self.mixer_running:
+                self.start_mixer_source(base_url, source)
+
+    def start_audio_monitor(self):
+        if self.mixer_running:
+            self.log("[AUDIO] Mixer already running")
+            return
+
+        try:
+            backend, cmd = self.choose_playback_command()
+        except Exception as e:
+            self.log(f"[AUDIO] {e}")
+            return
+
+        self.sync_mixer_sources()
+
+        if not self.mixer_sources:
+            self.log("[AUDIO] No recorders are currently in play mode")
+            return
+
+        self.mixer_stop_event = threading.Event()
+        self.mixer_running = True
+        self.log(f"[AUDIO] Starting mixer via {backend}")
+
+        with self.mixer_lock:
+            for base_url, source in self.mixer_sources.items():
+                self.start_mixer_source(base_url, source)
+
+        self.mixer_thread = threading.Thread(
+            target=self._mixer_worker,
+            args=(cmd,),
+            daemon=True,
+        )
+        self.mixer_thread.start()
+
+    def _audio_stream_worker(self, base_url, source):
+        device = quote(source.get("device", "default"), safe="")
+        stream_url = self.build_url_for(base_url, f"/audio/stream?device={device}")
+        self.event_queue.put(("debug", f"[AUDIO] Stream open {stream_url}"))
+
+        try:
+            with requests.get(
+                stream_url,
+                stream=True,
+                timeout=(REQUEST_TIMEOUT, 5),
+            ) as response:
+                if response.status_code != 200:
+                    self.event_queue.put(("mixer_error", f"[AUDIO] HTTP {response.status_code} from {stream_url}"))
+                    return
+
+                for chunk in response.iter_content(chunk_size=AUDIO_CHUNK_BYTES):
+                    if source["stop_event"].is_set() or self.mixer_stop_event.is_set():
+                        break
+
+                    if not chunk:
+                        continue
+
+                    try:
+                        source["queue"].put_nowait(chunk)
+                    except queue.Empty:
+                        pass
+                    except queue.Full:
+                        try:
+                            source["queue"].get_nowait()
+                            source["queue"].put_nowait(chunk)
+                        except Exception:
+                            pass
+
+        except Exception as e:
+            if not source["stop_event"].is_set() and not self.mixer_stop_event.is_set():
+                self.event_queue.put(("mixer_error", f"[AUDIO] {base_url} {type(e).__name__}: {e}"))
+
+        finally:
+            source["level"] = 0.0
+            self.event_queue.put(("debug", f"[AUDIO] Stream closed {base_url}"))
+
+    def source_samples(self, source, frames):
+        wanted_bytes = frames * 2
+        buffer = source.setdefault("buffer", bytearray())
+
+        while True:
+            try:
+                buffer.extend(source["queue"].get_nowait())
+            except queue.Empty:
+                break
+
+        if len(buffer) > AUDIO_SOURCE_BUFFER_MAX_BYTES:
+            del buffer[:len(buffer) - AUDIO_SOURCE_BUFFER_MAX_BYTES]
+
+        raw = bytes(buffer[:wanted_bytes])
+        del buffer[:min(len(buffer), wanted_bytes)]
+
+        if len(raw) < wanted_bytes:
+            raw += b"\x00" * (wanted_bytes - len(raw))
+
+        return self.pcm_samples(raw)
+
+    def pcm_samples(self, chunk):
+        if not chunk:
+            return array.array("h")
+
+        if len(chunk) % 2:
+            chunk = chunk[:-1]
+
+        samples = array.array("h")
+        samples.frombytes(chunk)
+
+        if sys.byteorder != "little":
+            samples.byteswap()
+
+        return samples
+
+    def pcm_level(self, samples):
+        if not samples:
+            return 0.0
+
+        square_sum = sum(sample * sample for sample in samples)
+        rms = math.sqrt(square_sum / len(samples))
+        return min(1.0, rms / 12000.0)
+
+    def _mixer_worker(self, cmd):
         try:
             proc = subprocess.Popen(
                 cmd,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
-                text=True,
             )
-            self.event_queue.put(("audio_started", (proc, stream_url)))
-            _, stderr = proc.communicate()
-            self.event_queue.put(("audio_exited", (proc, proc.returncode, stderr)))
-
+            self.mixer_process = proc
         except Exception as e:
-            self.event_queue.put((
-                "audio_error",
-                f"[AUDIO] Could not start monitor: {type(e).__name__}: {e}",
-            ))
-
-    def stop_audio_monitor(self, quiet=False):
-        if self.audio_starting:
-            self.audio_starting = False
-            if not quiet:
-                self.log("[AUDIO] Monitor launch is still in progress")
+            self.event_queue.put(("mixer_error", f"[AUDIO] Could not start playback: {type(e).__name__}: {e}"))
+            self.event_queue.put(("mixer_stopped", "[AUDIO] Mixer stopped"))
             return
 
-        if not self.audio_process or self.audio_process.poll() is not None:
-            self.audio_process = None
-            if not quiet:
-                self.log("[AUDIO] Monitor is not running")
-            return
-
-        self.audio_process.terminate()
+        frames = AUDIO_CHUNK_BYTES // 2
+        chunk_seconds = AUDIO_CHUNK_BYTES / (AUDIO_RATE * AUDIO_CHANNELS * 2)
 
         try:
-            self.audio_process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            self.audio_process.kill()
+            while not self.mixer_stop_event.is_set():
+                with self.mixer_lock:
+                    sources = list(self.mixer_sources.values())
 
-        self.audio_process = None
-        self.log("[AUDIO] Monitor stopped")
+                mixed = [0] * frames
+
+                for source in sources:
+                    samples = self.source_samples(source, frames)
+                    level = self.pcm_level(samples)
+
+                    with self.mixer_lock:
+                        source["level"] = level
+                        volume = source["volume"]
+                        mute = source["mute"]
+
+                    if mute or not samples:
+                        continue
+
+                    sample_count = min(frames, len(samples))
+
+                    for index in range(sample_count):
+                        mixed[index] += int(samples[index] * volume)
+
+                for index, sample in enumerate(mixed):
+                    mixed[index] = max(-32768, min(32767, sample))
+
+                output = array.array("h", mixed)
+
+                if sys.byteorder != "little":
+                    output.byteswap()
+
+                proc.stdin.write(output.tobytes())
+                proc.stdin.flush()
+                self.mixer_stop_event.wait(chunk_seconds)
+
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            self.event_queue.put(("mixer_error", f"[AUDIO] Mixer error: {type(e).__name__}: {e}"))
+
+        finally:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
+
+            if proc.poll() is None:
+                proc.terminate()
+
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+            stderr = ""
+
+            try:
+                if proc.stderr:
+                    stderr = proc.stderr.read().decode(errors="replace").strip()
+            except Exception:
+                stderr = ""
+
+            if stderr:
+                self.event_queue.put(("mixer_error", f"[AUDIO] Playback stderr:\n{stderr[-2000:]}"))
+
+            self.mixer_process = None
+            self.event_queue.put(("mixer_stopped", f"[AUDIO] Mixer stopped with code {proc.returncode}"))
+
+    def draw_level_dots(self, canvas, level):
+        canvas.delete("all")
+
+        lit = int(round(clamp(level, 0.0, 1.0) * AUDIO_LEVEL_DOTS))
+        radius = 4
+        gap = 5
+
+        for index in range(AUDIO_LEVEL_DOTS):
+            x = 4 + index * (radius + gap)
+            color = "#22b14c" if index < lit else "#d9eadf"
+            canvas.create_oval(x, 5, x + radius, 5 + radius, fill=color, outline=color)
+
+    def update_mixer_meters(self):
+        with self.mixer_lock:
+            levels = {
+                base_url: source.get("level", 0.0)
+                for base_url, source in self.mixer_sources.items()
+            }
+
+        for base_url, row in list(self.mixer_rows.items()):
+            self.draw_level_dots(row["canvas"], levels.get(base_url, 0.0))
+
+        self.root.after(100, self.update_mixer_meters)
+
+    def stop_audio_monitor(self, quiet=False):
+        if not self.mixer_running:
+            if not quiet:
+                self.log("[AUDIO] Mixer is not running")
+            return
+
+        self.mixer_stop_event.set()
+
+        with self.mixer_lock:
+            for source in self.mixer_sources.values():
+                self.stop_mixer_source(source)
+
+        if self.mixer_process and self.mixer_process.poll() is None:
+            self.mixer_process.terminate()
+
+            try:
+                self.mixer_process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.mixer_process.kill()
+
+        self.mixer_process = None
+        self.mixer_running = False
+
+        if not quiet:
+            self.log("[AUDIO] Mixer stopping")
 
     def send_custom(self):
         path = self.custom_path.get().strip()
