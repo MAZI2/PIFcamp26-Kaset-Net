@@ -29,7 +29,7 @@ RECORDER_EN = 23   # whole-recorder enable pin; HIGH = enabled by default
 
 AMP_ON = 17        # HIGH = amp on, LOW = muted
 MIC_SW = 27        # LOW = mic connected, HIGH = mic disconnected
-CD4053_PWR = 22    # Direct CD4053 VDD power: HIGH = powered, LOW = off
+CD4053_PWR = 22    # Direct CD4053 VDD power: output HIGH = powered, input/high-Z = off
 
 ERASE_IN1 = 5      # DRV8833 erase channel IN1
 ERASE_IN2 = 6      # DRV8833 erase channel IN2
@@ -150,8 +150,12 @@ def enable_level(on: bool) -> int:
 
 
 def cd4053_power(on: bool):
-    state["cd4053_powered"] = True
-    write(CD4053_PWR, 1)
+    state["cd4053_powered"] = bool(on)
+
+    if on:
+        lgpio.gpio_claim_output(h, CD4053_PWR, 1)
+    else:
+        lgpio.gpio_claim_input(h, CD4053_PWR)
 
 
 def open_gpiochip():
@@ -215,7 +219,6 @@ def claim_outputs():
         (RECORDER_EN, enable_level(False)),
         (AMP_ON, 0),
         (MIC_SW, 1),
-        (CD4053_PWR, 1),
         (ERASE_IN1, 0),
         (ERASE_IN2, 0),
         (MOTOR_IN3, 0),
@@ -225,6 +228,9 @@ def claim_outputs():
     for pin, initial_level in pins:
         lgpio.gpio_claim_output(h, pin, initial_level)
         debug(f"Claimed GPIO {pin} as output, initial={initial_level}")
+
+    cd4053_power(False)
+    debug(f"Claimed GPIO {CD4053_PWR} as input/high-Z")
 
 
 # ============================================================
@@ -586,6 +592,8 @@ def set_play():
     cd4053_power(True)
     time.sleep(0.05)
     write(MIC_SW, 1)
+    time.sleep(0.05)
+    cd4053_power(False)
     time.sleep(0.05)
 
     update_amp_mute()
