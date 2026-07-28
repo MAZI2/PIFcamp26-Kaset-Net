@@ -29,7 +29,7 @@ RECORDER_EN = 23   # whole-recorder enable pin; HIGH = enabled by default
 
 AMP_ON = 17        # HIGH = amp on, LOW = muted
 MIC_SW = 27        # LOW = mic connected, HIGH = mic disconnected
-RECORD_LED = 22    # active-low LED
+CD4053_PWR = 22    # Direct CD4053 VDD power: HIGH = powered, LOW = off
 
 ERASE_IN1 = 5      # DRV8833 erase channel IN1
 ERASE_IN2 = 6      # DRV8833 erase channel IN2
@@ -92,6 +92,7 @@ state = {
     "motor_speed": 0,          # 0–255
     "motor_reverse": False,
     "motor_pwm_freq_hz": DEFAULT_MOTOR_PWM_FREQ_HZ,
+    "cd4053_powered": False,
 }
 
 
@@ -146,6 +147,11 @@ def enable_level(on: bool) -> int:
     if RECORDER_ENABLE_ACTIVE_HIGH:
         return 1 if on else 0
     return 0 if on else 1
+
+
+def cd4053_power(on: bool):
+    state["cd4053_powered"] = bool(on)
+    write(CD4053_PWR, 1 if on else 0)
 
 
 def open_gpiochip():
@@ -209,7 +215,7 @@ def claim_outputs():
         (RECORDER_EN, enable_level(False)),
         (AMP_ON, 0),
         (MIC_SW, 1),
-        (RECORD_LED, 1),
+        (CD4053_PWR, 0),
         (ERASE_IN1, 0),
         (ERASE_IN2, 0),
         (MOTOR_IN3, 0),
@@ -500,7 +506,7 @@ def set_recorder_power(on: bool):
         apply_motor()
         write(AMP_ON, 0)
         write(MIC_SW, 1)
-        write(RECORD_LED, 1)
+        cd4053_power(False)
 
 
 def ensure_motor_for_record():
@@ -540,10 +546,7 @@ def set_record(mute_amp=True, connect_mic=True, record_led=True):
     state["mode"] = "record"
 
     if record_led:
-        debug("Record step: LED ON")
-        write(RECORD_LED, 0)
-    else:
-        debug("Record step: LED left unchanged")
+        debug("Record step: LED request ignored; GPIO 22 powers CD4053")
 
     if mute_amp:
         debug("Record step: amp muted")
@@ -553,6 +556,9 @@ def set_record(mute_amp=True, connect_mic=True, record_led=True):
         debug("Record step: amp left unchanged")
 
     if connect_mic:
+        debug("Record step: CD4053 powered")
+        cd4053_power(True)
+        time.sleep(0.05)
         debug("Record step: mic/record path connected")
         write(MIC_SW, 0)
         time.sleep(0.05)
@@ -577,9 +583,12 @@ def set_play():
     state["mode"] = "play"
 
     write(AMP_ON, 0)
+    cd4053_power(True)
+    time.sleep(0.05)
     write(MIC_SW, 1)
-    time.sleep(0.1)
-    write(RECORD_LED, 1)
+    time.sleep(0.05)
+    cd4053_power(False)
+    time.sleep(0.05)
 
     update_amp_mute()
 
@@ -675,7 +684,7 @@ def setup():
 
     write(AMP_ON, 0)
     write(MIC_SW, 1)
-    write(RECORD_LED, 1)
+    cd4053_power(False)
 
     stop_waveform(MOTOR_IN3)
     stop_waveform(MOTOR_IN4)
@@ -704,7 +713,7 @@ def cleanup():
     try:
         write(AMP_ON, 0)
         write(MIC_SW, 1)
-        write(RECORD_LED, 1)
+        cd4053_power(False)
         write(RECORDER_EN, enable_level(False))
     except Exception:
         pass
@@ -744,7 +753,7 @@ def index():
     <p><a href="/record">Record</a></p>
     <p><a href="/record?mute=0">Record without amp mute</a></p>
     <p><a href="/record?mic=0">Record without mic switch</a></p>
-    <p><a href="/record?mute=0&mic=0&led=0">Record logic only</a></p>
+    <p><a href="/record?mute=0&mic=0">Record logic only</a></p>
 
     <h3>Erase</h3>
     <p><a href="/erase/on">Erase ON default</a></p>
@@ -768,8 +777,8 @@ def index():
     <p><a href="/debug/amp/off">Debug amp OFF</a></p>
     <p><a href="/debug/mic/play">Debug mic PLAY path</a></p>
     <p><a href="/debug/mic/record">Debug mic RECORD path</a></p>
-    <p><a href="/debug/led/on">Debug record LED ON</a></p>
-    <p><a href="/debug/led/off">Debug record LED OFF</a></p>
+    <p><a href="/debug/cd4053/on">Debug CD4053 power ON</a></p>
+    <p><a href="/debug/cd4053/off">Debug CD4053 power OFF</a></p>
     """
 
 
@@ -954,18 +963,18 @@ def route_debug_mic_record():
     return jsonify(state)
 
 
-@app.route("/debug/led/on", methods=["GET", "POST"])
-def route_debug_led_on():
-    debug("HTTP /debug/led/on")
-    write(RECORD_LED, 0)
+@app.route("/debug/cd4053/on", methods=["GET", "POST"])
+def route_debug_cd4053_on():
+    debug("HTTP /debug/cd4053/on")
+    cd4053_power(True)
     apply_motor()
     return jsonify(state)
 
 
-@app.route("/debug/led/off", methods=["GET", "POST"])
-def route_debug_led_off():
-    debug("HTTP /debug/led/off")
-    write(RECORD_LED, 1)
+@app.route("/debug/cd4053/off", methods=["GET", "POST"])
+def route_debug_cd4053_off():
+    debug("HTTP /debug/cd4053/off")
+    cd4053_power(False)
     apply_motor()
     return jsonify(state)
 
