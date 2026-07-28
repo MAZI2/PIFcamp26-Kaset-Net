@@ -5,7 +5,6 @@ import re
 import shutil
 import socket
 import subprocess
-import threading
 import time
 
 from flask import Flask, Response, jsonify, request, stream_with_context
@@ -30,7 +29,7 @@ RECORDER_EN = 23   # whole-recorder enable pin; HIGH = enabled by default
 
 AMP_ON = 17        # HIGH = amp on, LOW = muted
 MIC_SW = 27        # LOW = mic connected, HIGH = mic disconnected
-CD4053_PWR = 22    # PNP high-side switch: LOW = CD4053 powered, HIGH = off
+RECORD_LED = 22    # active-low LED
 
 ERASE_IN1 = 5      # DRV8833 erase channel IN1
 ERASE_IN2 = 6      # DRV8833 erase channel IN2
@@ -57,8 +56,6 @@ MIN_MOTOR_SPEED = 0
 DEFAULT_MOTOR_SPEED = 180
 DEFAULT_MOTOR_PWM_FREQ_HZ = 1000
 MOTOR_DRIVE_MODE = "slow_decay"  # "slow_decay" is usually smoother on DRV8833.
-CD4053_OFF_DURING_PLAYBACK = True
-CD4053_PLAYBACK_HOLD_INTERVAL = 1.0
 
 # Web server.
 HTTP_PORT = 5000
@@ -86,9 +83,6 @@ h = None
 zeroconf = None
 service_info = None
 motor_output_reverse = None
-cd4053_watchdog_stop = threading.Event()
-mic_sw_driven = False
-cd4053_pwr_driven = False
 
 state = {
     "recorder_enabled": False,
@@ -98,7 +92,6 @@ state = {
     "motor_speed": 0,          # 0–255
     "motor_reverse": False,
     "motor_pwm_freq_hz": DEFAULT_MOTOR_PWM_FREQ_HZ,
-    "cd4053_powered": False,
 }
 
 
@@ -155,22 +148,6 @@ def enable_level(on: bool) -> int:
     return 0 if on else 1
 
 
-def cd4053_power(on: bool):
-    global cd4053_pwr_driven
-
-    state["cd4053_powered"] = bool(on)
-
-    if on:
-        if not cd4053_pwr_driven:
-            lgpio.gpio_claim_output(h, CD4053_PWR, 0)
-            cd4053_pwr_driven = True
-        else:
-            write(CD4053_PWR, 0)
-    else:
-        lgpio.gpio_claim_input(h, CD4053_PWR)
-        cd4053_pwr_driven = False
-
-
 def open_gpiochip():
     last_error = None
 
@@ -188,25 +165,6 @@ def open_gpiochip():
 
 def write(pin: int, level: int):
     lgpio.gpio_write(h, pin, 1 if level else 0)
-
-
-def set_mic_sw(level: int):
-    global mic_sw_driven
-
-    level = 1 if level else 0
-
-    if not mic_sw_driven:
-        lgpio.gpio_claim_output(h, MIC_SW, level)
-        mic_sw_driven = True
-    else:
-        write(MIC_SW, level)
-
-
-def release_mic_sw():
-    global mic_sw_driven
-
-    lgpio.gpio_claim_input(h, MIC_SW)
-    mic_sw_driven = False
 
 
 def stop_waveform(pin: int):
@@ -250,6 +208,8 @@ def claim_outputs():
     pins = [
         (RECORDER_EN, enable_level(False)),
         (AMP_ON, 0),
+        (MIC_SW, 1),
+        (RECORD_LED, 1),
         (ERASE_IN1, 0),
         (ERASE_IN2, 0),
         (MOTOR_IN3, 0),
@@ -259,11 +219,6 @@ def claim_outputs():
     for pin, initial_level in pins:
         lgpio.gpio_claim_output(h, pin, initial_level)
         debug(f"Claimed GPIO {pin} as output, initial={initial_level}")
-
-    release_mic_sw()
-    debug(f"Claimed GPIO {MIC_SW} as input/high-Z")
-    cd4053_power(False)
-    debug(f"Claimed GPIO {CD4053_PWR} as input/high-Z")
 
 
 # ============================================================
@@ -533,67 +488,6 @@ def update_amp_mute():
         write(AMP_ON, 1)
 
 
-def set_cd4053_playback_off():
-    debug("CD4053: playback, control pin high-Z")
-    release_mic_sw()
-
-    debug("CD4053: playback, power off")
-    cd4053_power(False)
-    time.sleep(0.1)
-
-
-def set_cd4053_play_path():
-    debug("CD4053: power on for playback path")
-    cd4053_power(True)
-    time.sleep(0.05)
-
-    debug("CD4053: playback path selected")
-    set_mic_sw(1)
-    time.sleep(0.05)
-
-
-def hold_cd4053_playback_state():
-    if CD4053_OFF_DURING_PLAYBACK:
-        release_mic_sw()
-        cd4053_power(False)
-    else:
-        cd4053_power(True)
-        set_mic_sw(1)
-
-
-def cd4053_playback_watchdog():
-    while not cd4053_watchdog_stop.wait(CD4053_PLAYBACK_HOLD_INTERVAL):
-        if h is None:
-            continue
-
-        if (
-            state["recorder_enabled"]
-            and state["mode"] == "play"
-            and not state["erase"]
-        ):
-            try:
-                hold_cd4053_playback_state()
-            except Exception as e:
-                debug(f"CD4053 playback hold failed: {e}")
-
-
-def start_cd4053_watchdog():
-    cd4053_watchdog_stop.clear()
-    thread = threading.Thread(target=cd4053_playback_watchdog, daemon=True)
-    thread.start()
-    debug("CD4053 playback watchdog started")
-
-
-def set_cd4053_record_path():
-    debug("CD4053: power on for record-path switch")
-    cd4053_power(True)
-    time.sleep(0.05)
-
-    debug("CD4053: record path selected")
-    set_mic_sw(0)
-    time.sleep(0.05)
-
-
 def set_recorder_power(on: bool):
     debug(f"Recorder power {'ON' if on else 'OFF'}")
 
@@ -605,8 +499,8 @@ def set_recorder_power(on: bool):
         state["motor_speed"] = 0
         apply_motor()
         write(AMP_ON, 0)
-        release_mic_sw()
-        cd4053_power(False)
+        write(MIC_SW, 1)
+        write(RECORD_LED, 1)
 
 
 def ensure_motor_for_record():
@@ -646,7 +540,10 @@ def set_record(mute_amp=True, connect_mic=True, record_led=True):
     state["mode"] = "record"
 
     if record_led:
-        debug("Record step: LED request ignored; GPIO 22 is CD4053 power")
+        debug("Record step: LED ON")
+        write(RECORD_LED, 0)
+    else:
+        debug("Record step: LED left unchanged")
 
     if mute_amp:
         debug("Record step: amp muted")
@@ -657,7 +554,8 @@ def set_record(mute_amp=True, connect_mic=True, record_led=True):
 
     if connect_mic:
         debug("Record step: mic/record path connected")
-        set_cd4053_record_path()
+        write(MIC_SW, 0)
+        time.sleep(0.05)
     else:
         debug("Record step: mic/record path left unchanged")
 
@@ -679,11 +577,9 @@ def set_play():
     state["mode"] = "play"
 
     write(AMP_ON, 0)
-
-    if CD4053_OFF_DURING_PLAYBACK:
-        set_cd4053_playback_off()
-    else:
-        set_cd4053_play_path()
+    write(MIC_SW, 1)
+    time.sleep(0.1)
+    write(RECORD_LED, 1)
 
     update_amp_mute()
 
@@ -778,8 +674,8 @@ def setup():
     stop_erase_outputs()
 
     write(AMP_ON, 0)
-    release_mic_sw()
-    cd4053_power(False)
+    write(MIC_SW, 1)
+    write(RECORD_LED, 1)
 
     stop_waveform(MOTOR_IN3)
     stop_waveform(MOTOR_IN4)
@@ -787,14 +683,12 @@ def setup():
     set_recorder_power(True)
     time.sleep(0.2)
     set_play()
-    start_cd4053_watchdog()
 
     debug("GPIO setup complete")
 
 
 def cleanup():
     debug("Cleanup started")
-    cd4053_watchdog_stop.set()
 
     try:
         erase_off()
@@ -809,8 +703,8 @@ def cleanup():
 
     try:
         write(AMP_ON, 0)
-        release_mic_sw()
-        cd4053_power(False)
+        write(MIC_SW, 1)
+        write(RECORD_LED, 1)
         write(RECORDER_EN, enable_level(False))
     except Exception:
         pass
@@ -850,7 +744,7 @@ def index():
     <p><a href="/record">Record</a></p>
     <p><a href="/record?mute=0">Record without amp mute</a></p>
     <p><a href="/record?mic=0">Record without mic switch</a></p>
-    <p><a href="/record?mute=0&mic=0">Record logic only</a></p>
+    <p><a href="/record?mute=0&mic=0&led=0">Record logic only</a></p>
 
     <h3>Erase</h3>
     <p><a href="/erase/on">Erase ON default</a></p>
@@ -874,11 +768,8 @@ def index():
     <p><a href="/debug/amp/off">Debug amp OFF</a></p>
     <p><a href="/debug/mic/play">Debug mic PLAY path</a></p>
     <p><a href="/debug/mic/record">Debug mic RECORD path</a></p>
-    <p><a href="/debug/mic/high">Debug MIC_SW HIGH</a></p>
-    <p><a href="/debug/mic/low">Debug MIC_SW LOW</a></p>
-    <p><a href="/debug/mic/release">Debug MIC_SW high-Z</a></p>
-    <p><a href="/debug/cd4053/on">Debug CD4053 power ON</a></p>
-    <p><a href="/debug/cd4053/off">Debug CD4053 power OFF</a></p>
+    <p><a href="/debug/led/on">Debug record LED ON</a></p>
+    <p><a href="/debug/led/off">Debug record LED OFF</a></p>
     """
 
 
@@ -1050,10 +941,7 @@ def route_debug_amp_off():
 @app.route("/debug/mic/play", methods=["GET", "POST"])
 def route_debug_mic_play():
     debug("HTTP /debug/mic/play")
-    if CD4053_OFF_DURING_PLAYBACK:
-        set_cd4053_playback_off()
-    else:
-        set_cd4053_play_path()
+    write(MIC_SW, 1)
     apply_motor()
     return jsonify(state)
 
@@ -1061,48 +949,23 @@ def route_debug_mic_play():
 @app.route("/debug/mic/record", methods=["GET", "POST"])
 def route_debug_mic_record():
     debug("HTTP /debug/mic/record")
-    set_cd4053_record_path()
+    write(MIC_SW, 0)
     apply_motor()
     return jsonify(state)
 
 
-@app.route("/debug/mic/high", methods=["GET", "POST"])
-def route_debug_mic_high():
-    debug("HTTP /debug/mic/high")
-    set_mic_sw(1)
+@app.route("/debug/led/on", methods=["GET", "POST"])
+def route_debug_led_on():
+    debug("HTTP /debug/led/on")
+    write(RECORD_LED, 0)
     apply_motor()
     return jsonify(state)
 
 
-@app.route("/debug/mic/low", methods=["GET", "POST"])
-def route_debug_mic_low():
-    debug("HTTP /debug/mic/low")
-    set_mic_sw(0)
-    apply_motor()
-    return jsonify(state)
-
-
-@app.route("/debug/mic/release", methods=["GET", "POST"])
-def route_debug_mic_release():
-    debug("HTTP /debug/mic/release")
-    release_mic_sw()
-    apply_motor()
-    return jsonify(state)
-
-
-@app.route("/debug/cd4053/on", methods=["GET", "POST"])
-def route_debug_cd4053_on():
-    debug("HTTP /debug/cd4053/on")
-    cd4053_power(True)
-    apply_motor()
-    return jsonify(state)
-
-
-@app.route("/debug/cd4053/off", methods=["GET", "POST"])
-def route_debug_cd4053_off():
-    debug("HTTP /debug/cd4053/off")
-    release_mic_sw()
-    cd4053_power(False)
+@app.route("/debug/led/off", methods=["GET", "POST"])
+def route_debug_led_off():
+    debug("HTTP /debug/led/off")
+    write(RECORD_LED, 1)
     apply_motor()
     return jsonify(state)
 
