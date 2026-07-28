@@ -150,8 +150,8 @@ def enable_level(on: bool) -> int:
 
 
 def cd4053_power(on: bool):
-    state["cd4053_powered"] = bool(on)
-    write(CD4053_PWR, 1 if on else 0)
+    state["cd4053_powered"] = True
+    write(CD4053_PWR, 1)
 
 
 def open_gpiochip():
@@ -215,7 +215,7 @@ def claim_outputs():
         (RECORDER_EN, enable_level(False)),
         (AMP_ON, 0),
         (MIC_SW, 1),
-        (CD4053_PWR, 0),
+        (CD4053_PWR, 1),
         (ERASE_IN1, 0),
         (ERASE_IN2, 0),
         (MOTOR_IN3, 0),
@@ -586,8 +586,6 @@ def set_play():
     cd4053_power(True)
     time.sleep(0.05)
     write(MIC_SW, 1)
-    time.sleep(0.05)
-    cd4053_power(False)
     time.sleep(0.05)
 
     update_amp_mute()
