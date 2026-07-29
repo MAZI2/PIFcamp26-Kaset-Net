@@ -8,8 +8,10 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
+import wave
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, filedialog
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import requests
@@ -103,10 +105,15 @@ class RecorderGUI:
         self.mixer_sources = {}
         self.mixer_rows = {}
         self.mixer_lock = threading.Lock()
+        self.clip_lock = threading.Lock()
+        self.clip_recording = False
+        self.clip_started_at = None
+        self.clip_frames = bytearray()
 
         self.manual_host = tk.StringVar(value="192.168.0.9")
         self.audio_device = tk.StringVar(value="auto")
         self.erase_freq = tk.StringVar(value=ERASE_FREQ_OPTIONS[0])
+        self.clip_status = tk.StringVar(value="Clip idle")
 
         self.motor_speed = tk.IntVar(value=MIN_MOTOR_SPEED)
         self.zeroconf = None
@@ -115,6 +122,11 @@ class RecorderGUI:
 
         self.configure_style()
         self.build_ui()
+
+        self.root.bind_all("<Control-a>", self.select_all_devices_event)
+        self.root.bind_all("<Control-A>", self.select_all_devices_event)
+        self.root.bind_all("<Command-a>", self.select_all_devices_event)
+        self.root.bind_all("<Command-A>", self.select_all_devices_event)
 
         self.log("[INIT] GUI started")
         self.log("[INIT] Add recorders manually, or press Find to browse with mDNS.")
@@ -146,8 +158,36 @@ class RecorderGUI:
         style.configure("Horizontal.TScale", background="white")
 
     def build_ui(self):
-        main = ttk.Frame(self.root, padding=10)
-        main.pack(fill=tk.BOTH, expand=True)
+        scroll_shell = ttk.Frame(self.root)
+        scroll_shell.pack(fill=tk.BOTH, expand=True)
+
+        self.scroll_canvas = tk.Canvas(
+            scroll_shell,
+            bg="white",
+            highlightthickness=0,
+        )
+        self.scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scroll_bar = ttk.Scrollbar(
+            scroll_shell,
+            orient=tk.VERTICAL,
+            command=self.scroll_canvas.yview,
+        )
+        scroll_bar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.scroll_canvas.configure(yscrollcommand=scroll_bar.set)
+
+        main = ttk.Frame(self.scroll_canvas, padding=10)
+        self.scroll_window = self.scroll_canvas.create_window(
+            (0, 0),
+            window=main,
+            anchor="nw",
+        )
+
+        main.bind("<Configure>", self.update_scroll_region)
+        self.scroll_canvas.bind("<Configure>", self.resize_scroll_window)
+        self.root.bind_all("<MouseWheel>", self.scroll_main_event)
+        self.root.bind_all("<Button-4>", self.scroll_main_event)
+        self.root.bind_all("<Button-5>", self.scroll_main_event)
 
         # Discovery section
         discovery_frame = ttk.LabelFrame(main, text="Discovered recorders", padding=10)
@@ -274,8 +314,6 @@ class RecorderGUI:
 
         ttk.Button(direction_frame, text="Forward", command=lambda: self.command("/reverse/off")).pack(side=tk.LEFT, padx=3)
         ttk.Button(direction_frame, text="Reverse", command=lambda: self.command("/reverse/on")).pack(side=tk.LEFT, padx=3)
-        ttk.Button(direction_frame, text="Forward + Speed", command=self.motor_forward).pack(side=tk.LEFT, padx=3)
-        ttk.Button(direction_frame, text="Reverse + Speed", command=self.motor_reverse).pack(side=tk.LEFT, padx=3)
 
         # Audio mixer
         audio_frame = ttk.LabelFrame(main, text="Audio mixer", padding=10)
@@ -295,6 +333,9 @@ class RecorderGUI:
         ttk.Button(audio_controls, text="Start Mixer", command=self.start_audio_monitor).pack(side=tk.LEFT, padx=3)
         ttk.Button(audio_controls, text="Stop Mixer", command=self.stop_audio_monitor).pack(side=tk.LEFT, padx=3)
         ttk.Button(audio_controls, text="List Devices", command=lambda: self.command("/audio/devices")).pack(side=tk.LEFT, padx=3)
+        ttk.Button(audio_controls, text="Record Clip", command=self.start_clip_recording).pack(side=tk.LEFT, padx=3)
+        ttk.Button(audio_controls, text="Stop + Save", command=self.stop_clip_recording).pack(side=tk.LEFT, padx=3)
+        ttk.Label(audio_controls, textvariable=self.clip_status, width=18).pack(side=tk.LEFT, padx=6)
 
         self.mixer_rows_frame = ttk.Frame(audio_frame)
         self.mixer_rows_frame.pack(fill=tk.X, pady=(8, 0))
@@ -336,6 +377,31 @@ class RecorderGUI:
 
         ttk.Button(bottom, text="Clear Log", command=self.clear_log).pack(side=tk.LEFT)
         ttk.Button(bottom, text="Quit", command=self.quit).pack(side=tk.RIGHT)
+
+    def update_scroll_region(self, _event=None):
+        self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
+
+    def resize_scroll_window(self, event):
+        self.scroll_canvas.itemconfigure(self.scroll_window, width=event.width)
+
+    def scroll_main_event(self, event):
+        widget_class = event.widget.winfo_class()
+
+        if widget_class in ["Listbox", "Text"]:
+            return None
+
+        if getattr(event, "num", None) == 4:
+            direction = -1
+            amount = 3
+        elif getattr(event, "num", None) == 5:
+            direction = 1
+            amount = 3
+        else:
+            direction = -1 if event.delta > 0 else 1
+            amount = max(1, abs(int(event.delta / 120)))
+
+        self.scroll_canvas.yview_scroll(direction * amount, "units")
+        return "break"
 
     # --------------------------------------------------------
     # LOGGING / EVENTS
@@ -404,6 +470,9 @@ class RecorderGUI:
                     self.mixer_running = False
                     self.log(payload)
 
+                    if self.clip_recording:
+                        self.stop_clip_recording()
+
         except queue.Empty:
             pass
 
@@ -438,6 +507,15 @@ class RecorderGUI:
     def select_all_devices(self):
         self.device_list.selection_set(0, tk.END)
         self.log(f"[TARGETS] Selected {len(self.device_list.curselection())} recorder(s)")
+
+    def select_all_devices_event(self, event=None):
+        widget = getattr(event, "widget", None)
+
+        if widget is not None and widget.winfo_class() in ["Entry", "TEntry", "Text"]:
+            return None
+
+        self.select_all_devices()
+        return "break"
 
     def update_device_state(self, base_url, transport_mode=None, erase_active=None):
         dev = self.devices.get(base_url)
@@ -655,14 +733,6 @@ class RecorderGUI:
     def apply_motor_speed(self):
         speed = self.motor_speed.get()
         self.command(f"/motor?speed={speed}")
-
-    def motor_forward(self):
-        speed = self.motor_speed.get()
-        self.command(f"/motor?speed={speed}&reverse=0")
-
-    def motor_reverse(self):
-        speed = self.motor_speed.get()
-        self.command(f"/motor?speed={speed}&reverse=1")
 
     def playable_mixer_urls(self):
         return [
@@ -941,6 +1011,79 @@ class RecorderGUI:
         rms = math.sqrt(square_sum / len(samples))
         return min(1.0, rms / 12000.0)
 
+    def start_clip_recording(self):
+        if self.clip_recording:
+            self.log("[AUDIO] Clip recording is already running")
+            return
+
+        if not self.mixer_running:
+            self.start_audio_monitor()
+
+        if not self.mixer_running:
+            self.log("[AUDIO] Clip recording needs at least one playable mixer source")
+            return
+
+        with self.clip_lock:
+            self.clip_frames = bytearray()
+            self.clip_started_at = time.monotonic()
+            self.clip_recording = True
+
+        self.clip_status.set("Recording 0.0s")
+        self.log("[AUDIO] Clip recording started")
+
+    def append_clip_audio(self, chunk):
+        with self.clip_lock:
+            if self.clip_recording:
+                self.clip_frames.extend(chunk)
+
+    def stop_clip_recording(self):
+        with self.clip_lock:
+            if not self.clip_recording:
+                self.log("[AUDIO] Clip recording is not running")
+                return
+
+            audio_data = bytes(self.clip_frames)
+            seconds = 0.0
+
+            if self.clip_started_at is not None:
+                seconds = time.monotonic() - self.clip_started_at
+
+            self.clip_recording = False
+            self.clip_started_at = None
+            self.clip_frames = bytearray()
+
+        if not audio_data:
+            self.clip_status.set("Clip empty")
+            self.log("[AUDIO] Clip recording stopped, but no audio was captured")
+            return
+
+        default_name = time.strftime("cassette_clip_%Y%m%d_%H%M%S.wav")
+        filename = filedialog.asksaveasfilename(
+            title="Save recorded clip",
+            defaultextension=".wav",
+            initialfile=default_name,
+            filetypes=[("WAV audio", "*.wav"), ("All files", "*.*")],
+        )
+
+        if not filename:
+            self.clip_status.set("Clip discarded")
+            self.log("[AUDIO] Clip recording discarded")
+            return
+
+        try:
+            with wave.open(filename, "wb") as wav_file:
+                wav_file.setnchannels(AUDIO_CHANNELS)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(AUDIO_RATE)
+                wav_file.writeframes(audio_data)
+
+            self.clip_status.set(f"Saved {seconds:.1f}s")
+            self.log(f"[AUDIO] Clip saved: {filename} ({seconds:.1f}s)")
+
+        except Exception as e:
+            self.clip_status.set("Save failed")
+            self.log(f"[AUDIO] Clip save failed: {type(e).__name__}: {e}")
+
     def _mixer_worker(self, cmd):
         try:
             proc = subprocess.Popen(
@@ -991,7 +1134,10 @@ class RecorderGUI:
                 if sys.byteorder != "little":
                     output.byteswap()
 
-                proc.stdin.write(output.tobytes())
+                output_bytes = output.tobytes()
+                self.append_clip_audio(output_bytes)
+
+                proc.stdin.write(output_bytes)
                 proc.stdin.flush()
                 self.mixer_stop_event.wait(chunk_seconds)
 
@@ -1051,6 +1197,11 @@ class RecorderGUI:
         for base_url, row in list(self.mixer_rows.items()):
             self.draw_level_dots(row["canvas"], levels.get(base_url, 0.0))
 
+        with self.clip_lock:
+            if self.clip_recording and self.clip_started_at is not None:
+                seconds = time.monotonic() - self.clip_started_at
+                self.clip_status.set(f"Recording {seconds:.1f}s")
+
         self.root.after(100, self.update_mixer_meters)
 
     def stop_audio_monitor(self, quiet=False):
@@ -1076,6 +1227,15 @@ class RecorderGUI:
         self.mixer_process = None
         self.mixer_running = False
 
+        if self.clip_recording:
+            if quiet:
+                with self.clip_lock:
+                    self.clip_recording = False
+                    self.clip_started_at = None
+                    self.clip_frames = bytearray()
+            else:
+                self.stop_clip_recording()
+
         if not quiet:
             self.log("[AUDIO] Mixer stopping")
 
@@ -1085,6 +1245,11 @@ class RecorderGUI:
 
     def quit(self):
         self.log("[QUIT] Closing")
+
+        with self.clip_lock:
+            self.clip_recording = False
+            self.clip_started_at = None
+            self.clip_frames = bytearray()
 
         if self.zeroconf is not None:
             try:

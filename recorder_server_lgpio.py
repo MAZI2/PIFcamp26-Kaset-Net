@@ -53,7 +53,6 @@ ERASE_DUTY_PERCENT = 45
 
 # Motor PWM.
 MIN_MOTOR_SPEED = 0
-DEFAULT_MOTOR_SPEED = 180
 DEFAULT_MOTOR_PWM_FREQ_HZ = 1000
 MOTOR_DRIVE_MODE = "slow_decay"  # "slow_decay" is usually smoother on DRV8833.
 
@@ -126,15 +125,6 @@ def normalize_motor_speed(speed) -> int:
 
 def effective_motor_speed() -> int:
     speed = normalize_motor_speed(state["motor_speed"])
-
-    if (
-        state["recorder_enabled"]
-        and state["mode"] == "record"
-        and speed == 0
-    ):
-        debug(f"Record mode requires motor; forcing speed {DEFAULT_MOTOR_SPEED}")
-        speed = DEFAULT_MOTOR_SPEED
-
     state["motor_speed"] = speed
     return speed
 
@@ -533,26 +523,8 @@ def set_recorder_power(on: bool):
 
 def ensure_motor_for_record():
     speed = normalize_motor_speed(state["motor_speed"])
-
-    if speed == 0:
-        debug(f"Record mode starting motor at {DEFAULT_MOTOR_SPEED}")
-        state["motor_speed"] = DEFAULT_MOTOR_SPEED
-        apply_motor()
-        return
-
     state["motor_speed"] = speed
-
-    if motor_output_reverse is None:
-        debug("Record mode motor state unknown; applying motor")
-        apply_motor()
-        return
-
-    if motor_output_reverse != bool(state["motor_reverse"]):
-        debug("Record mode motor direction changed; applying motor")
-        apply_motor()
-        return
-
-    debug(f"Record mode preserving running motor at speed {speed}")
+    debug(f"Record mode leaving motor speed unchanged at {speed}")
 
 
 def set_record(mute_amp=True, connect_mic=True, record_led=True):
@@ -945,9 +917,6 @@ def route_debug_motor_reapply():
     if not state["recorder_enabled"]:
         set_recorder_power(True)
         time.sleep(0.2)
-
-    if state["motor_speed"] == 0:
-        state["motor_speed"] = DEFAULT_MOTOR_SPEED
 
     apply_motor()
     return jsonify(state)

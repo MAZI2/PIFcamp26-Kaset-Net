@@ -19,7 +19,6 @@ const int MOTOR_IN3  = 9;   // DRV8833 motor channel IN3
 const int MOTOR_IN4  = 10;  // DRV8833 motor channel IN4
 
 const int MIN_MOTOR_SPEED = 0;
-const int DEFAULT_MOTOR_SPEED = 180;
 const int DEFAULT_ERASE_FREQ_HZ = 20000;
 const unsigned long SERIAL_WAIT_MS = 3000;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
@@ -119,10 +118,6 @@ void applyMotor() {
 
   currentMotorPWM = normalizeMotorSpeed(currentMotorPWM);
 
-  if (currentRecordMode && currentMotorPWM == 0) {
-    currentMotorPWM = DEFAULT_MOTOR_SPEED;
-  }
-
   if (currentMotorPWM == 0) {
     analogWrite(MOTOR_IN3, 0);
     analogWrite(MOTOR_IN4, 0);
@@ -155,19 +150,7 @@ void applyMotor() {
 }
 
 void ensureMotorForRecord() {
-  int speed = normalizeMotorSpeed(currentMotorPWM);
-
-  if (speed == 0) {
-    currentMotorPWM = DEFAULT_MOTOR_SPEED;
-    applyMotor();
-    return;
-  }
-
-  currentMotorPWM = speed;
-
-  if (!motorOutputKnown || motorOutputReverse != currentMotorReverse) {
-    applyMotor();
-  }
+  currentMotorPWM = normalizeMotorSpeed(currentMotorPWM);
 }
 
 void delayWithUpdates(unsigned long ms) {
