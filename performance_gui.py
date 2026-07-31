@@ -945,7 +945,10 @@ class PerformanceGUI:
             "queue": queue.Queue(maxsize=64),
             "buffer": bytearray(),
             "loop_buffer": bytearray(),
+            "loop_buffer_start_bytes": 0,
             "buffer_playhead": 0,
+            "input_bytes": 0,
+            "playout_bytes": 0,
             "stop_event": threading.Event(),
             "thread": None,
             "level": 0.0,
@@ -1058,14 +1061,28 @@ class PerformanceGUI:
         if not chunk:
             return
 
+        if len(chunk) % 2:
+            chunk = chunk[:-1]
+
         with source["lock"]:
             loop_buffer = source.setdefault("loop_buffer", bytearray())
             loop_buffer.extend(chunk)
+            source["input_bytes"] = source.get("input_bytes", 0) + len(chunk)
 
             if len(loop_buffer) > AUDIO_LOOP_BUFFER_MAX_BYTES:
                 del loop_buffer[:len(loop_buffer) - AUDIO_LOOP_BUFFER_MAX_BYTES]
 
+            source["loop_buffer_start_bytes"] = source.get("input_bytes", 0) - len(loop_buffer)
             source["last_audio_at"] = time.time()
+
+    def detected_loop_bytes(self, source, available_bytes):
+        detected_bytes = int(source.get("loop_seconds", 0.0) * AUDIO_RATE * AUDIO_CHANNELS * 2)
+        detected_bytes -= detected_bytes % 2
+
+        if detected_bytes > 0 and detected_bytes <= available_bytes:
+            return detected_bytes
+
+        return available_bytes - (available_bytes % 2)
 
     def loop_buffer_seconds(self, source):
         with source["lock"]:
@@ -1225,6 +1242,9 @@ class PerformanceGUI:
         if len(raw) < wanted_bytes:
             raw += b"\x00" * (wanted_bytes - len(raw))
 
+        with source["lock"]:
+            source["playout_bytes"] = source.get("playout_bytes", 0) + wanted_bytes
+
         return self.pcm_samples(raw)
 
     def buffered_loop_samples(self, source, frames):
@@ -1237,20 +1257,17 @@ class PerformanceGUI:
                 source["kind"] = "empty"
                 return array.array("h", [0] * frames)
 
-            detected_bytes = int(source.get("loop_seconds", 0.0) * AUDIO_RATE * AUDIO_CHANNELS * 2)
-            detected_bytes -= detected_bytes % 2
-
-            if detected_bytes > 0 and detected_bytes <= len(loop_buffer):
-                loop_bytes = detected_bytes
-            else:
-                loop_bytes = len(loop_buffer) - (len(loop_buffer) % 2)
+            loop_bytes = self.detected_loop_bytes(source, len(loop_buffer))
 
             if loop_bytes <= 0:
                 source["kind"] = "empty"
                 return array.array("h", [0] * frames)
 
             loop = bytes(loop_buffer[-loop_bytes:])
-            playhead = source.get("buffer_playhead", 0) % len(loop)
+            input_bytes = source.get("input_bytes", 0)
+            loop_start_bytes = input_bytes - loop_bytes
+            playout_bytes = source.get("playout_bytes", 0)
+            playhead = (playout_bytes - loop_start_bytes) % len(loop)
             raw = bytearray()
 
             while len(raw) < wanted_bytes:
@@ -1258,6 +1275,7 @@ class PerformanceGUI:
                 raw.extend(loop[playhead:playhead + take])
                 playhead = (playhead + take) % len(loop)
 
+            source["playout_bytes"] = playout_bytes + wanted_bytes
             source["buffer_playhead"] = playhead
             source["kind"] = "buffer"
 
