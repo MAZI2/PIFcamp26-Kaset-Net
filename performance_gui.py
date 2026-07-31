@@ -734,7 +734,11 @@ class PerformanceGUI:
             dev.mode = mode
 
         if speed is not None:
-            dev.speed = int(speed)
+            new_speed = int(speed)
+
+            if new_speed != dev.speed:
+                dev.speed = new_speed
+                self.mark_speed_change(base_url)
 
         if reverse is not None:
             dev.reverse = bool(reverse)
@@ -787,7 +791,9 @@ class PerformanceGUI:
             elif command_path == RECORD_PATH:
                 dev.mode = "record"
             elif command_path == "/stop":
-                dev.speed = 0
+                if dev.speed != 0:
+                    dev.speed = 0
+                    self.mark_speed_change(url)
             elif command_path == "/reverse/on":
                 dev.reverse = True
             elif command_path == "/reverse/off":
@@ -797,10 +803,25 @@ class PerformanceGUI:
                 match = re.search(r"(?:^|&)speed=(\d+)", query)
 
                 if match:
-                    dev.speed = int(match.group(1))
+                    new_speed = int(match.group(1))
+
+                    if new_speed != dev.speed:
+                        dev.speed = new_speed
+                        self.mark_speed_change(url)
 
         self.redraw()
         self.sync_mixer_sources()
+
+    def mark_speed_change(self, base_url):
+        with self.mixer_lock:
+            source = self.mixer_sources.get(base_url)
+
+        if not source:
+            return
+
+        with source["lock"]:
+            source["analysis_start_bytes"] = source.get("input_bytes", 0)
+            source["last_analysis_at"] = 0.0
 
     def request_async(self, urls, path):
         thread = threading.Thread(
@@ -949,6 +970,10 @@ class PerformanceGUI:
             "buffer_playhead": 0,
             "input_bytes": 0,
             "playout_bytes": 0,
+            "capture_speed": 0,
+            "capture_loop_seconds": 0.0,
+            "speed_loop_measurements": {},
+            "buffer_rate": 1.0,
             "stop_event": threading.Event(),
             "thread": None,
             "level": 0.0,
@@ -957,6 +982,7 @@ class PerformanceGUI:
             "loop_confidence": 0.0,
             "last_audio_at": 0.0,
             "last_analysis_at": 0.0,
+            "analysis_start_bytes": 0,
             "lock": threading.Lock(),
         }
 
@@ -1057,7 +1083,7 @@ class PerformanceGUI:
         source["level"] = 0.0
         source["kind"] = "idle"
 
-    def append_loop_buffer(self, source, chunk):
+    def append_loop_buffer(self, source, chunk, speed=0):
         if not chunk:
             return
 
@@ -1074,6 +1100,77 @@ class PerformanceGUI:
 
             source["loop_buffer_start_bytes"] = source.get("input_bytes", 0) - len(loop_buffer)
             source["last_audio_at"] = time.time()
+
+            if speed > 0:
+                source["capture_speed"] = speed
+
+    def update_speed_loop_measurement(self, source, speed, loop_seconds, confidence):
+        if speed <= 0 or loop_seconds <= 0.0 or confidence < 0.20:
+            return
+
+        measurements = source.setdefault("speed_loop_measurements", {})
+        speed = int(speed)
+        existing = measurements.get(speed)
+
+        if existing:
+            measurements[speed] = existing * 0.80 + loop_seconds * 0.20
+        else:
+            measurements[speed] = loop_seconds
+
+        source["capture_speed"] = speed
+        source["capture_loop_seconds"] = loop_seconds
+
+    def measured_loop_seconds_for_speed(self, source, speed):
+        measurements = source.get("speed_loop_measurements", {})
+
+        if not measurements or speed <= 0:
+            return 0.0
+
+        speed = int(speed)
+
+        if speed in measurements:
+            return measurements[speed]
+
+        measured_speeds = sorted(measurements)
+
+        if len(measured_speeds) == 1:
+            return measurements[measured_speeds[0]]
+
+        lower = None
+        upper = None
+
+        for measured_speed in measured_speeds:
+            if measured_speed < speed:
+                lower = measured_speed
+            elif measured_speed > speed and upper is None:
+                upper = measured_speed
+
+        if lower is None:
+            lower = measured_speeds[0]
+            upper = measured_speeds[1]
+        elif upper is None:
+            lower = measured_speeds[-2]
+            upper = measured_speeds[-1]
+
+        if upper == lower:
+            return measurements[lower]
+
+        fraction = (speed - lower) / (upper - lower)
+        return measurements[lower] + (measurements[upper] - measurements[lower]) * fraction
+
+    def buffer_speed_ratio(self, source, dev):
+        current_speed = dev.speed if dev else 0
+
+        if current_speed <= 0:
+            return 0.0
+
+        target_loop_seconds = self.measured_loop_seconds_for_speed(source, current_speed)
+        capture_loop_seconds = source.get("capture_loop_seconds", 0.0) or source.get("loop_seconds", 0.0)
+
+        if target_loop_seconds <= 0.0 or capture_loop_seconds <= 0.0:
+            return 1.0
+
+        return clamp(capture_loop_seconds / target_loop_seconds, 0.25, 4.0)
 
     def detected_loop_bytes(self, source, available_bytes):
         detected_bytes = int(source.get("loop_seconds", 0.0) * AUDIO_RATE * AUDIO_CHANNELS * 2)
@@ -1110,7 +1207,7 @@ class PerformanceGUI:
 
         return f"Loop:   {loop_label}\nBuffer: {buffer_seconds:4.1f}s {kind}"
 
-    def maybe_analyze_loop(self, source):
+    def maybe_analyze_loop(self, source, dev=None):
         now = time.time()
 
         if now - source.get("last_analysis_at", 0.0) < LOOP_ANALYSIS_INTERVAL_SECONDS:
@@ -1119,13 +1216,18 @@ class PerformanceGUI:
         source["last_analysis_at"] = now
 
         with source["lock"]:
-            raw = bytes(source.get("loop_buffer", b""))
+            loop_buffer = source.get("loop_buffer", b"")
+            buffer_start = source.get("loop_buffer_start_bytes", 0)
+            analysis_start = source.get("analysis_start_bytes", 0)
+            offset = max(0, int(analysis_start - buffer_start))
+            raw = bytes(loop_buffer[offset:])
 
         min_bytes = int(LOOP_MIN_SECONDS * AUDIO_RATE * AUDIO_CHANNELS * 2 * 2)
 
         if len(raw) < min_bytes:
-            source["loop_seconds"] = 0.0
-            source["loop_confidence"] = 0.0
+            if not raw:
+                source["loop_seconds"] = 0.0
+                source["loop_confidence"] = 0.0
             return
 
         max_bytes = int(LOOP_ANALYSIS_SECONDS * AUDIO_RATE * AUDIO_CHANNELS * 2)
@@ -1177,8 +1279,12 @@ class PerformanceGUI:
                 best_lag = lag
 
         if best_lag > 0 and best_score > 0.20:
-            source["loop_seconds"] = best_lag * frame_seconds
+            loop_seconds = best_lag * frame_seconds
+            source["loop_seconds"] = loop_seconds
             source["loop_confidence"] = clamp(best_score, 0.0, 1.0)
+
+            if dev and dev.mode == "play":
+                self.update_speed_loop_measurement(source, dev.speed, loop_seconds, source["loop_confidence"])
         else:
             source["loop_seconds"] = 0.0
             source["loop_confidence"] = 0.0
@@ -1204,7 +1310,8 @@ class PerformanceGUI:
                     if not chunk:
                         continue
 
-                    self.append_loop_buffer(source, chunk)
+                    dev = self.devices.get(base_url)
+                    self.append_loop_buffer(source, chunk, dev.speed if dev else 0)
 
                     try:
                         source["queue"].put_nowait(chunk)
@@ -1247,14 +1354,19 @@ class PerformanceGUI:
 
         return self.pcm_samples(raw)
 
-    def buffered_loop_samples(self, source, frames):
-        wanted_bytes = frames * 2
-
+    def buffered_loop_samples(self, source, frames, dev):
         with source["lock"]:
             loop_buffer = source.get("loop_buffer", bytearray())
 
             if not loop_buffer:
                 source["kind"] = "empty"
+                return array.array("h", [0] * frames)
+
+            speed_ratio = self.buffer_speed_ratio(source, dev)
+            source["buffer_rate"] = speed_ratio
+
+            if speed_ratio <= 0.0:
+                source["kind"] = "stopped"
                 return array.array("h", [0] * frames)
 
             loop_bytes = self.detected_loop_bytes(source, len(loop_buffer))
@@ -1267,19 +1379,28 @@ class PerformanceGUI:
             input_bytes = source.get("input_bytes", 0)
             loop_start_bytes = input_bytes - loop_bytes
             playout_bytes = source.get("playout_bytes", 0)
-            playhead = (playout_bytes - loop_start_bytes) % len(loop)
-            raw = bytearray()
+            loop_samples = self.pcm_samples(loop)
 
-            while len(raw) < wanted_bytes:
-                take = min(wanted_bytes - len(raw), len(loop) - playhead)
-                raw.extend(loop[playhead:playhead + take])
-                playhead = (playhead + take) % len(loop)
+            if not loop_samples:
+                source["kind"] = "empty"
+                return array.array("h", [0] * frames)
 
-            source["playout_bytes"] = playout_bytes + wanted_bytes
-            source["buffer_playhead"] = playhead
-            source["kind"] = "buffer"
+            playhead_frames = ((playout_bytes - loop_start_bytes) / 2.0) % len(loop_samples)
+            output = array.array("h")
 
-        return self.pcm_samples(bytes(raw))
+            for _index in range(frames):
+                index_a = int(playhead_frames) % len(loop_samples)
+                index_b = (index_a + 1) % len(loop_samples)
+                fraction = playhead_frames - int(playhead_frames)
+                sample = loop_samples[index_a] * (1.0 - fraction) + loop_samples[index_b] * fraction
+                output.append(int(clamp(sample, -32768, 32767)))
+                playhead_frames = (playhead_frames + speed_ratio) % len(loop_samples)
+
+            source["playout_bytes"] = playout_bytes + frames * 2 * speed_ratio
+            source["buffer_playhead"] = int(playhead_frames * 2)
+            source["kind"] = f"buffer {speed_ratio:.2f}x"
+
+        return output
 
     def _mixer_worker(self, cmd):
         try:
@@ -1318,9 +1439,9 @@ class PerformanceGUI:
                         samples = self.source_samples(source, frames)
                         source["kind"] = "live"
                     else:
-                        samples = self.buffered_loop_samples(source, frames)
+                        samples = self.buffered_loop_samples(source, frames, dev)
 
-                    self.maybe_analyze_loop(source)
+                    self.maybe_analyze_loop(source, dev)
                     level = self.pcm_level(samples)
                     source["level"] = level
                     volume = dev.monitor_volume if dev else 1.0
