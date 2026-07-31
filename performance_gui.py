@@ -6,12 +6,16 @@ uniformly onto the laptop's 1366 x 768 display.  The design itself never grows:
 on a larger monitor, fullscreen mode only adds black space around the centered
 1366 x 768 canvas.
 
-This file deliberately contains no recorder, network, audio, or motor logic.
+This file deliberately contains no embedded recorder, network, audio, or motor
+logic. Press F2 to open the live `recorder_gui.py` controller from this branch.
 """
 
 from __future__ import annotations
 
 import argparse
+import pathlib
+import subprocess
+import sys
 import tkinter as tk
 from dataclasses import dataclass
 
@@ -20,6 +24,8 @@ REFERENCE_WIDTH = 1680
 REFERENCE_HEIGHT = 945
 DESIGN_WIDTH = 1366
 DESIGN_HEIGHT = 768
+PROJECT_DIR = pathlib.Path(__file__).resolve().parent
+LIVE_CONTROLLER = PROJECT_DIR / "recorder_gui.py"
 
 BG = "#090b0b"
 PANEL = "#101212"
@@ -374,7 +380,7 @@ class MixerArtwork:
         self.text(752, 915, "ALSA (hw:1,0)", size=13, fill=GREEN, anchor="w")
         self.text(894, 915, "|", size=13, fill=MUTED, anchor="center")
         self.text(938, 915, "TIME: 14:32:18", size=13, anchor="w")
-        self.text(1628, 915, "ENDPOINT: /status", size=13, anchor="e")
+        self.text(1628, 915, "F2: LIVE CONTROLLER", size=13, anchor="e")
 
 
 class PerformanceGUI:
@@ -401,6 +407,7 @@ class PerformanceGUI:
 
         self.root.bind("<Escape>", lambda _event: self.root.destroy())
         self.root.bind("<F11>", self.toggle_fullscreen)
+        self.root.bind("<F2>", self.open_live_controller)
         self.root.protocol("WM_DELETE_WINDOW", self.root.destroy)
 
         if windowed:
@@ -432,6 +439,13 @@ class PerformanceGUI:
         self.root.overrideredirect(False)
         self.root.geometry(f"{DESIGN_WIDTH}x{DESIGN_HEIGHT}")
         self.root.minsize(DESIGN_WIDTH, DESIGN_HEIGHT)
+
+    def open_live_controller(self, _event: tk.Event[tk.Misc] | None = None) -> str:
+        subprocess.Popen(
+            [sys.executable, str(LIVE_CONTROLLER)],
+            cwd=str(PROJECT_DIR),
+        )
+        return "break"
 
 
 def parse_args() -> argparse.Namespace:
