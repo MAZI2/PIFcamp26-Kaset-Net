@@ -4,6 +4,7 @@ import array
 import json
 import math
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -109,6 +110,9 @@ class RecorderGUI:
         self.audio_send_process = None
         self.audio_send_thread = None
         self.audio_send_stop_event = threading.Event()
+        self.audio_send_source_options = []
+        self.audio_send_source_map = {}
+        self.audio_send_level = 0.0
         self.clip_lock = threading.Lock()
         self.clip_recording = False
         self.clip_started_at = None
@@ -119,6 +123,8 @@ class RecorderGUI:
         self.audio_output_device = tk.StringVar(value="auto")
         self.audio_send_source = tk.StringVar(value="0" if sys.platform == "darwin" else "default")
         self.audio_send_status = tk.StringVar(value="Send idle")
+        self.audio_send_gain = tk.DoubleVar(value=1.0)
+        self.audio_send_gain_label = tk.StringVar(value="1.0x")
         self.erase_freq = tk.StringVar(value=ERASE_FREQ_OPTIONS[0])
         self.clip_status = tk.StringVar(value="Clip idle")
 
@@ -140,6 +146,7 @@ class RecorderGUI:
 
         self.root.after(100, self.process_events)
         self.root.after(100, self.update_mixer_meters)
+        self.root.after(500, self.list_local_audio_sources)
 
     # --------------------------------------------------------
     # UI
@@ -351,11 +358,12 @@ class RecorderGUI:
         send_frame.pack(fill=tk.X, pady=(8, 0))
 
         ttk.Label(send_frame, text="Send source:").pack(side=tk.LEFT, padx=3)
-        ttk.Entry(
+        self.audio_send_source_combo = ttk.Combobox(
             send_frame,
             textvariable=self.audio_send_source,
-            width=12,
-        ).pack(side=tk.LEFT, padx=3)
+            width=28,
+        )
+        self.audio_send_source_combo.pack(side=tk.LEFT, padx=3)
 
         ttk.Label(send_frame, text="Pi output:").pack(side=tk.LEFT, padx=3)
         ttk.Entry(
@@ -364,9 +372,29 @@ class RecorderGUI:
             width=14,
         ).pack(side=tk.LEFT, padx=3)
 
+        ttk.Label(send_frame, text="Gain:").pack(side=tk.LEFT, padx=3)
+        ttk.Scale(
+            send_frame,
+            from_=0.25,
+            to=4.0,
+            orient=tk.HORIZONTAL,
+            variable=self.audio_send_gain,
+            command=self.on_audio_send_gain,
+            length=90,
+        ).pack(side=tk.LEFT, padx=3)
+        ttk.Label(send_frame, textvariable=self.audio_send_gain_label, width=5).pack(side=tk.LEFT, padx=3)
+
         ttk.Button(send_frame, text="Start Send", command=self.start_audio_send).pack(side=tk.LEFT, padx=3)
         ttk.Button(send_frame, text="Stop Send", command=self.stop_audio_send).pack(side=tk.LEFT, padx=3)
         ttk.Button(send_frame, text="List Local Inputs", command=self.list_local_audio_sources).pack(side=tk.LEFT, padx=3)
+        self.audio_send_meter = tk.Canvas(
+            send_frame,
+            width=112,
+            height=18,
+            bg="white",
+            highlightthickness=0,
+        )
+        self.audio_send_meter.pack(side=tk.LEFT, padx=8)
         ttk.Label(send_frame, textvariable=self.audio_send_status, width=16).pack(side=tk.LEFT, padx=6)
 
         # Quick command entry
@@ -505,8 +533,12 @@ class RecorderGUI:
                 elif event == "audio_send_stopped":
                     self.audio_send_running = False
                     self.audio_send_process = None
+                    self.audio_send_level = 0.0
                     self.audio_send_status.set(payload)
                     self.log(f"[AUDIO SEND] {payload}")
+
+                elif event == "audio_send_sources":
+                    self.set_audio_send_sources(payload)
 
         except queue.Empty:
             pass
@@ -817,7 +849,7 @@ class RecorderGUI:
         raise RuntimeError("No audio player found. Install ffmpeg/ffplay on macOS or alsa-utils/aplay on Linux.")
 
     def choose_audio_send_command(self):
-        source = self.audio_send_source.get().strip()
+        source = self.selected_audio_send_source_id()
         ffmpeg = shutil.which("ffmpeg")
         arecord = shutil.which("arecord")
 
@@ -872,6 +904,101 @@ class RecorderGUI:
 
         raise RuntimeError("No local audio capture tool found. Install ffmpeg or alsa-utils.")
 
+    def selected_audio_send_source_id(self):
+        selected = self.audio_send_source.get().strip()
+        return self.audio_send_source_map.get(selected, selected)
+
+    def on_audio_send_gain(self, _value=None):
+        self.audio_send_gain_label.set(f"{self.audio_send_gain.get():.1f}x")
+
+    def apply_pcm_gain(self, chunk, gain):
+        if abs(gain - 1.0) < 0.001:
+            return chunk
+
+        samples = self.pcm_samples(chunk)
+
+        for index, sample in enumerate(samples):
+            samples[index] = int(clamp(sample * gain, -32768, 32767))
+
+        if sys.byteorder != "little":
+            samples.byteswap()
+
+        return samples.tobytes()
+
+    def set_audio_send_sources(self, sources):
+        self.audio_send_source_options = sources
+        self.audio_send_source_map = {
+            source["label"]: source["id"]
+            for source in sources
+        }
+
+        labels = [source["label"] for source in sources]
+        self.audio_send_source_combo.configure(values=labels)
+
+        current = self.audio_send_source.get().strip()
+        id_to_label = {
+            source["id"]: source["label"]
+            for source in sources
+        }
+
+        if current in id_to_label:
+            self.audio_send_source.set(id_to_label[current])
+        elif labels and current not in labels:
+            self.audio_send_source.set(labels[0])
+
+        self.log(f"[AUDIO SEND] Found {len(labels)} local input source(s)")
+
+    def parse_macos_avfoundation_sources(self, output):
+        sources = []
+        in_audio_section = False
+
+        for line in output.splitlines():
+            if "AVFoundation audio devices:" in line:
+                in_audio_section = True
+                continue
+
+            if "AVFoundation video devices:" in line:
+                in_audio_section = False
+                continue
+
+            if not in_audio_section:
+                continue
+
+            match = re.search(r"\[(\d+)\]\s+(.+)$", line)
+
+            if not match:
+                continue
+
+            source_id, name = match.groups()
+            sources.append({
+                "id": source_id,
+                "label": f"{source_id}: {name.strip()}",
+            })
+
+        return sources
+
+    def parse_linux_alsa_sources(self, output):
+        sources = [{"id": "default", "label": "default: ALSA default input"}]
+
+        for line in output.splitlines():
+            if not line or line[0].isspace():
+                continue
+
+            source_id = line.strip()
+
+            if source_id == "null":
+                continue
+
+            label = source_id
+
+            if source_id == "default":
+                label = "default: ALSA default input"
+
+            if not any(source["id"] == source_id for source in sources):
+                sources.append({"id": source_id, "label": label})
+
+        return sources
+
     def list_local_audio_sources(self):
         thread = threading.Thread(target=self._list_local_audio_sources_worker, daemon=True)
         thread.start()
@@ -900,6 +1027,8 @@ class RecorderGUI:
                 )
 
                 output = (result.stderr or result.stdout or "").strip()
+                sources = self.parse_macos_avfoundation_sources(output)
+                self.event_queue.put(("audio_send_sources", sources))
                 self.event_queue.put(("debug", f"[AUDIO SEND] Local macOS inputs:\n{output[-4000:]}"))
                 return
 
@@ -913,7 +1042,10 @@ class RecorderGUI:
                     timeout=8,
                     check=False,
                 )
-                self.event_queue.put(("debug", f"[AUDIO SEND] Local ALSA inputs:\n{result.stdout.strip()[-4000:]}"))
+                output = result.stdout.strip()
+                sources = self.parse_linux_alsa_sources(output)
+                self.event_queue.put(("audio_send_sources", sources))
+                self.event_queue.put(("debug", f"[AUDIO SEND] Local ALSA inputs:\n{output[-4000:]}"))
                 return
 
             self.event_queue.put(("debug", "[AUDIO SEND] No local input lister found"))
@@ -983,8 +1115,12 @@ class RecorderGUI:
                 if not chunk:
                     break
 
-                total_bytes += len(chunk)
-                yield chunk
+                gain = self.audio_send_gain.get()
+                output_chunk = self.apply_pcm_gain(chunk, gain)
+
+                total_bytes += len(output_chunk)
+                self.audio_send_level = self.pcm_level(self.pcm_samples(output_chunk))
+                yield output_chunk
 
         try:
             response = requests.post(
@@ -1463,6 +1599,9 @@ class RecorderGUI:
 
         for base_url, row in list(self.mixer_rows.items()):
             self.draw_level_dots(row["canvas"], levels.get(base_url, 0.0))
+
+        if hasattr(self, "audio_send_meter"):
+            self.draw_level_dots(self.audio_send_meter, self.audio_send_level)
 
         with self.clip_lock:
             if self.clip_recording and self.clip_started_at is not None:
