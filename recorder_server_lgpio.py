@@ -247,6 +247,10 @@ def find_arecord():
     return shutil.which("arecord")
 
 
+def find_aplay():
+    return shutil.which("aplay")
+
+
 def parse_alsa_capture_devices(arecord_output):
     card_pattern = re.compile(r"^card\s+(\d+):\s+([^\[]+).*device\s+(\d+):\s+([^\[]+)")
     devices = []
@@ -266,6 +270,32 @@ def parse_alsa_capture_devices(arecord_output):
         devices.append({"id": device_id, "name": label})
 
     return devices
+
+
+def parse_alsa_playback_devices(aplay_output):
+    card_pattern = re.compile(r"^card\s+(\d+):\s+([^\[]+).*device\s+(\d+):\s+([^\[]+)")
+    devices = []
+
+    if not aplay_output:
+        return devices
+
+    for line in aplay_output.splitlines():
+        match = card_pattern.search(line)
+
+        if not match:
+            continue
+
+        card, card_name, device, device_name = match.groups()
+        device_id = f"plughw:{card},{device}"
+        label = f"{card_name.strip()} / {device_name.strip()}"
+        devices.append({"id": device_id, "name": label})
+
+    return devices
+
+
+def alsa_card_id(device_id):
+    match = re.match(r"^plughw:(\d+),", str(device_id))
+    return match.group(1) if match else None
 
 
 def list_alsa_inputs():
@@ -318,6 +348,61 @@ def list_alsa_inputs():
     }
 
 
+def list_alsa_outputs():
+    aplay = find_aplay()
+
+    if not aplay:
+        return {
+            "backend": "alsa",
+            "default_output": AUDIO_DEVICE,
+            "outputs": [],
+            "error": "aplay not found. Install alsa-utils on the Raspberry Pi.",
+        }
+
+    devices = [
+        {"id": "default", "name": "ALSA default output"},
+        {"id": "auto", "name": "Auto-detect first ALSA playback output"},
+    ]
+
+    list_pcms = subprocess.run(
+        [aplay, "-L"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    if list_pcms.stdout:
+        for line in list_pcms.stdout.splitlines():
+            if not line or line[0].isspace():
+                continue
+
+            pcm_name = line.strip()
+
+            if pcm_name and pcm_name != "null":
+                devices.append({"id": pcm_name, "name": pcm_name})
+
+    list_cards = subprocess.run(
+        [aplay, "-l"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    for playback_device in parse_alsa_playback_devices(list_cards.stdout):
+        if not any(existing["id"] == playback_device["id"] for existing in devices):
+            devices.append(playback_device)
+
+    return {
+        "backend": "alsa",
+        "default_output": AUDIO_DEVICE,
+        "outputs": devices,
+        "aplay_l": list_cards.stdout.strip(),
+        "aplay_L": list_pcms.stdout.strip(),
+    }
+
+
 def choose_alsa_capture_device(device=None):
     if device and device not in ["auto"]:
         return device
@@ -343,6 +428,58 @@ def choose_alsa_capture_device(device=None):
         return chosen
 
     debug("No hardware ALSA capture input found; falling back to ALSA default")
+    return "default"
+
+
+def choose_alsa_playback_device(device=None):
+    if device and device not in ["auto"]:
+        return device
+
+    aplay = find_aplay()
+
+    if not aplay:
+        raise RuntimeError("aplay not found. Install alsa-utils on the Raspberry Pi.")
+
+    result = subprocess.run(
+        [aplay, "-l"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    devices = parse_alsa_playback_devices(result.stdout)
+
+    arecord = find_arecord()
+
+    if arecord:
+        capture_result = subprocess.run(
+            [arecord, "-l"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        capture_devices = parse_alsa_capture_devices(capture_result.stdout)
+
+        if capture_devices:
+            capture_card = alsa_card_id(capture_devices[0]["id"])
+
+            for playback_device in devices:
+                if alsa_card_id(playback_device["id"]) == capture_card:
+                    chosen = playback_device["id"]
+                    debug(
+                        "ALSA auto-selected playback output matching "
+                        f"capture card: {chosen} ({playback_device['name']})"
+                    )
+                    return chosen
+
+    if devices:
+        chosen = devices[0]["id"]
+        debug(f"ALSA auto-selected playback output: {chosen} ({devices[0]['name']})")
+        return chosen
+
+    debug("No hardware ALSA playback output found; falling back to ALSA default")
     return "default"
 
 
@@ -792,7 +929,9 @@ def route_audio_devices():
     debug("HTTP /audio/devices")
 
     try:
-        return jsonify(list_alsa_inputs())
+        data = list_alsa_inputs()
+        data.update(list_alsa_outputs())
+        return jsonify(data)
 
     except Exception as e:
         return jsonify({
@@ -883,6 +1022,118 @@ def route_audio_stream():
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.route("/audio/playback", methods=["POST"])
+def route_audio_playback():
+    if not find_aplay():
+        return jsonify({
+            "ok": False,
+            "error": "aplay not found. Install alsa-utils on the Raspberry Pi.",
+        }), 500
+
+    try:
+        device = choose_alsa_playback_device(request.args.get("device", AUDIO_DEVICE))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    rate = int(request.args.get("rate", AUDIO_RATE))
+    channels = int(request.args.get("channels", AUDIO_CHANNELS))
+
+    rate = int(clamp(rate, 8000, 96000))
+    channels = int(clamp(channels, 1, 2))
+
+    debug(
+        f"HTTP /audio/playback device={device} "
+        f"rate={rate} channels={channels}"
+    )
+
+    cmd = [
+        "aplay",
+        "-q",
+        "-D", device,
+        "-f", AUDIO_FORMAT,
+        "-r", str(rate),
+        "-c", str(channels),
+        "-t", "raw",
+    ]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+
+    debug(f"Audio playback started with PID {proc.pid}")
+    total_bytes = 0
+
+    try:
+        while True:
+            chunk = request.stream.read(4096)
+
+            if not chunk:
+                break
+
+            proc.stdin.write(chunk)
+            total_bytes += len(chunk)
+
+    except BrokenPipeError:
+        debug("Audio playback aplay pipe closed")
+
+    except Exception as e:
+        debug(f"Audio playback stream error: {type(e).__name__}: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    finally:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=1)
+
+        stderr = ""
+
+        try:
+            if proc.stderr:
+                stderr = proc.stderr.read().decode(errors="replace").strip()
+        except Exception:
+            stderr = ""
+
+        if stderr:
+            debug(f"Audio playback aplay stderr: {stderr}")
+
+        debug(
+            f"Audio playback stopped with exit {proc.returncode}, "
+            f"bytes={total_bytes}"
+        )
+
+    if proc.returncode not in [0, None]:
+        return jsonify({
+            "ok": False,
+            "exit": proc.returncode,
+            "stderr": stderr,
+            "bytes": total_bytes,
+        }), 500
+
+    return jsonify({
+        "ok": True,
+        "device": device,
+        "rate": rate,
+        "channels": channels,
+        "bytes": total_bytes,
+    })
 
 
 @app.route("/audio/record", methods=["GET"])

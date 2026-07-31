@@ -1,0 +1,223 @@
+Warning: Permanently added '192.168.43.107' (ED25519) to the list of known hosts.
+
+========== IDENTITY ==========
+Collected: 2026-07-29T09:47:13+00:00
+
+$ hostnamectl
+ Static hostname: Pi3-Rec4
+       Icon name: computer
+      Machine ID: 93079f89ae4048efb2bfe231fb41babc
+         Boot ID: 209cfd4e020b4e5090f4105c0e80f00b
+Operating System: Debian GNU/Linux 13 (trixie)
+          Kernel: Linux 6.18.34+rpt-rpi-v8
+    Architecture: arm64
+
+$ uname -a
+Linux Pi3-Rec4 6.18.34+rpt-rpi-v8 #1 SMP PREEMPT Debian 1:6.18.34-1+rpt1 (2026-06-09) aarch64 GNU/Linux
+
+$ cat /etc/os-release
+PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+NAME="Debian GNU/Linux"
+VERSION_ID="13"
+VERSION="13 (trixie)"
+VERSION_CODENAME=trixie
+DEBIAN_VERSION_FULL=13.5
+ID=debian
+HOME_URL="https://www.debian.org/"
+SUPPORT_URL="https://www.debian.org/support"
+BUG_REPORT_URL="https://bugs.debian.org/"
+
+========== UPTIME AND LOAD ==========
+
+$ uptime
+ 09:47:13 up 35 min,  1 user,  load average: 0.00, 0.00, 0.00
+
+$ who -b
+         system boot  2026-07-28 22:23
+
+$ free -h
+               total        used        free      shared  buff/cache   available
+Mem:           905Mi       172Mi       574Mi       3.8Mi       213Mi       732Mi
+Swap:          904Mi          0B       904Mi
+
+========== RASPBERRY PI HARDWARE ==========
+
+$ vcgencmd get_throttled
+throttled=0x0
+
+$ vcgencmd measure_temp
+temp=51.0'C
+
+$ vcgencmd get_mem arm
+arm=948M
+
+$ vcgencmd get_mem gpu
+gpu=76M
+CPU temperature: 51.0 °C
+Model: Raspberry Pi 3 Model B Rev 1.2
+Revision	: a02082
+Serial		: 00000000b8169819
+Model		: Raspberry Pi 3 Model B Rev 1.2
+
+========== NETWORK ==========
+
+$ ip -brief address
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+eth0             DOWN           
+wlan0            UP             192.168.43.107/24 fe80::ba27:ebff:fe43:cd4c/64 
+
+$ ip route
+default via 192.168.43.1 dev wlan0 proto dhcp src 192.168.43.107 metric 600 
+192.168.43.0/24 dev wlan0 proto kernel scope link src 192.168.43.107 metric 600 
+
+$ ip neigh
+192.168.43.1 dev wlan0 lladdr 6e:c7:ec:69:26:87 STALE 
+192.168.43.88 dev wlan0 lladdr 10:02:b5:c4:d6:d7 REACHABLE 
+
+$ nmcli -f DEVICE,TYPE,STATE,CONNECTION device status
+DEVICE         TYPE      STATE                   CONNECTION              
+wlan0          wifi      connected               netplan-wlan0-Galaxy s9 
+lo             loopback  connected (externally)  lo                      
+p2p-dev-wlan0  wifi-p2p  disconnected            --                      
+eth0           ethernet  unavailable             --                      
+
+========== STORAGE ==========
+
+$ df -hT
+Filesystem     Type      Size  Used Avail Use% Mounted on
+udev           devtmpfs  316M     0  316M   0% /dev
+tmpfs          tmpfs     182M  3.8M  178M   3% /run
+/dev/mmcblk0p2 ext4       29G  3.6G   24G  14% /
+tmpfs          tmpfs     453M     0  453M   0% /dev/shm
+tmpfs          tmpfs     5.0M   16K  5.0M   1% /run/lock
+tmpfs          tmpfs     1.0M     0  1.0M   0% /run/credentials/systemd-journald.service
+tmpfs          tmpfs     453M     0  453M   0% /tmp
+/dev/mmcblk0p1 vfat      505M   76M  429M  15% /boot/firmware
+tmpfs          tmpfs     1.0M     0  1.0M   0% /run/credentials/getty@tty1.service
+tmpfs          tmpfs     1.0M     0  1.0M   0% /run/credentials/serial-getty@ttyS0.service
+tmpfs          tmpfs      91M   12K   91M   1% /run/user/1000
+
+$ lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS,ROTA,MODEL
+NAME         SIZE FSTYPE MOUNTPOINTS    ROTA MODEL
+loop0        905M swap                     0 
+mmcblk0     29.1G                          0 
+├─mmcblk0p1  512M vfat   /boot/firmware    0 
+└─mmcblk0p2 28.6G ext4   /                 0 
+zram0        905M swap   [SWAP]            0 
+
+========== FAILED SERVICES ==========
+
+$ systemctl --failed --no-pager --plain
+UNIT LOAD ACTIVE SUB DESCRIPTION
+
+0 loaded units listed.
+
+$ systemctl status ssh --no-pager --lines=20
+● ssh.service - OpenBSD Secure Shell server
+     Loaded: loaded (/usr/lib/systemd/system/ssh.service; enabled; preset: enabled)
+     Active: active (running) since Tue 2026-07-28 22:24:01 UTC; 11h ago
+ Invocation: 20517ff0acd24bda8cc87a89c8c5e4a7
+       Docs: man:sshd(8)
+             man:sshd_config(5)
+    Process: 967 ExecStartPre=/usr/sbin/sshd -t (code=exited, status=0/SUCCESS)
+   Main PID: 982 (sshd)
+      Tasks: 1 (limit: 806)
+        CPU: 803ms
+     CGroup: /system.slice/ssh.service
+             └─982 "sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups"
+
+Jul 28 22:24:01 Pi3-Rec4 systemd[1]: Starting ssh.service - OpenBSD Secure Shell server...
+Jul 28 22:24:01 Pi3-Rec4 sshd[982]: Server listening on 0.0.0.0 port 22.
+Jul 28 22:24:01 Pi3-Rec4 sshd[982]: Server listening on :: port 22.
+Jul 28 22:24:01 Pi3-Rec4 systemd[1]: Started ssh.service - OpenBSD Secure Shell server.
+Jul 29 09:46:57 Pi3-Rec4 sshd-session[1153]: Connection closed by 192.168.43.88 port 53164
+Jul 29 09:47:11 Pi3-Rec4 sshd-session[1154]: Accepted password for pi from 192.168.43.88 port 53170 ssh2
+Jul 29 09:47:11 Pi3-Rec4 sshd-session[1154]: pam_unix(sshd:session): session opened for user pi(uid=1000) by pi(uid=0)
+
+========== LISTENING PORTS ==========
+
+$ ss -lntup
+Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess
+udp   UNCONN 0      0            0.0.0.0:5353       0.0.0.0:*          
+udp   UNCONN 0      0            0.0.0.0:49725      0.0.0.0:*          
+udp   UNCONN 0      0                  *:5353             *:*          
+udp   UNCONN 0      0                  *:45364            *:*          
+tcp   LISTEN 0      128          0.0.0.0:22         0.0.0.0:*          
+tcp   LISTEN 0      128             [::]:22            [::]:*          
+
+========== RECENT HIGH-PRIORITY LOGS ==========
+
+$ journalctl -b -p warning..alert --no-pager -n 120
+Jul 28 22:23:41 Pi3-Rec4 kernel: Core Release: 2.80a
+Jul 28 22:23:41 Pi3-Rec4 kernel: Setting default values for core params
+Jul 28 22:23:41 Pi3-Rec4 kernel: Finished setting default values for core params
+Jul 28 22:23:41 Pi3-Rec4 kernel: Using Buffer DMA mode
+Jul 28 22:23:41 Pi3-Rec4 kernel: Periodic Transfer Interrupt Enhancement - disabled
+Jul 28 22:23:41 Pi3-Rec4 kernel: Multiprocessor Interrupt Enhancement - disabled
+Jul 28 22:23:41 Pi3-Rec4 kernel: OTG VER PARAM: 0, OTG VER FLAG: 0
+Jul 28 22:23:41 Pi3-Rec4 kernel: Dedicated Tx FIFOs mode
+Jul 28 22:23:41 Pi3-Rec4 kernel: INFO:: FIQ DMA bounce buffers: virt = ffffffc080ccb000 dma = 0x00000000de400000 len=9024
+Jul 28 22:23:41 Pi3-Rec4 kernel: FIQ FSM acceleration enabled for :
+                                 Non-periodic Split Transactions
+                                 Periodic Split Transactions
+                                 High-Speed Isochronous Endpoints
+                                 Interrupt/Control Split Transaction hack enabled
+Jul 28 22:23:41 Pi3-Rec4 kernel: INFO:: MPHI regs_base at ffffffc080075000
+Jul 28 22:23:41 Pi3-Rec4 kernel: Init: Port Power? op_state=1
+Jul 28 22:23:41 Pi3-Rec4 kernel: Init: Power Port (0)
+Jul 28 22:23:41 Pi3-Rec4 kernel: Indeed it is in host mode hprt0 = 00021501
+Jul 28 22:23:41 Pi3-Rec4 kernel: Indeed it is in host mode hprt0 = 00001101
+Jul 28 22:23:41 Pi3-Rec4 kernel: mmc0: host does not support reading read-only switch, assuming write-enable
+Jul 28 22:23:41 Pi3-Rec4 systemd-udevd[327]: /usr/lib/udev/rules.d/90-alsa-restore.rules:18 GOTO="alsa_restore_std" has no matching label, ignoring.
+Jul 28 22:23:41 Pi3-Rec4 systemd-udevd[327]: /usr/lib/udev/rules.d/90-alsa-restore.rules:18 The line has no effect any more, dropping.
+Jul 28 22:23:41 Pi3-Rec4 systemd-udevd[327]: /usr/lib/udev/rules.d/90-alsa-restore.rules:22 GOTO="alsa_restore_std" has no matching label, ignoring.
+Jul 28 22:23:41 Pi3-Rec4 systemd-udevd[327]: /usr/lib/udev/rules.d/90-alsa-restore.rules:22 The line has no effect any more, dropping.
+Jul 28 22:23:42 Pi3-Rec4 kernel: snd_bcm2835: module is from the staging directory, the quality is unknown, you have been warned.
+Jul 28 22:23:43 Pi3-Rec4 kernel: vc_sm_cma: module is from the staging directory, the quality is unknown, you have been warned.
+Jul 28 22:23:43 Pi3-Rec4 kernel: bcm2835_mmal_vchiq: module is from the staging directory, the quality is unknown, you have been warned.
+Jul 28 22:23:43 Pi3-Rec4 kernel: bcm2835_v4l2: module is from the staging directory, the quality is unknown, you have been warned.
+Jul 28 22:23:43 Pi3-Rec4 kernel: bcm2835_isp: module is from the staging directory, the quality is unknown, you have been warned.
+Jul 28 22:23:43 Pi3-Rec4 kernel: hci_uart_bcm serial0-0: supply vbat not found, using dummy regulator
+Jul 28 22:23:43 Pi3-Rec4 kernel: hci_uart_bcm serial0-0: supply vddio not found, using dummy regulator
+Jul 28 22:23:43 Pi3-Rec4 kernel: bcm2835_codec: module is from the staging directory, the quality is unknown, you have been warned.
+Jul 28 22:23:44 Pi3-Rec4 (udev-worker)[360]: controlC1: Process '/usr/sbin/alsactl -E HOME=/run/alsa -E XDG_RUNTIME_DIR=/run/alsa/runtime restore 1' failed with exit code 99.
+Jul 28 22:23:48 Pi3-Rec4 (uetoothd)[550]: bluetooth.service: ConfigurationDirectory 'bluetooth' already exists but the mode is different. (File system: 755 ConfigurationDirectoryMode: 555)
+Jul 28 22:23:49 Pi3-Rec4 bluetoothd[550]: Failed to set mode: Failed (0x03)
+Jul 28 22:23:51 Pi3-Rec4 generate[617]: Permissions for /lib/netplan/00-network-manager-all.yaml are too open. Netplan configuration should NOT be accessible by others.
+Jul 28 22:23:54 Pi3-Rec4 generate[704]: Permissions for /lib/netplan/00-network-manager-all.yaml are too open. Netplan configuration should NOT be accessible by others.
+Jul 28 22:23:56 Pi3-Rec4 generate[791]: Permissions for /lib/netplan/00-network-manager-all.yaml are too open. Netplan configuration should NOT be accessible by others.
+Jul 28 22:23:59 Pi3-Rec4 generate[878]: Permissions for /lib/netplan/00-network-manager-all.yaml are too open. Netplan configuration should NOT be accessible by others.
+Jul 28 22:24:02 Pi3-Rec4 wpa_supplicant[581]: bgscan simple: Failed to enable signal strength monitoring
+
+========== KERNEL WARNINGS ==========
+[    2.317922] Core Release: 2.80a
+[    2.318626] Setting default values for core params
+[    2.319308] Finished setting default values for core params
+[    2.520218] Using Buffer DMA mode
+[    2.520897] Periodic Transfer Interrupt Enhancement - disabled
+[    2.521599] Multiprocessor Interrupt Enhancement - disabled
+[    2.522297] OTG VER PARAM: 0, OTG VER FLAG: 0
+[    2.522988] Dedicated Tx FIFOs mode
+[    2.527196] INFO:: FIQ DMA bounce buffers: virt = ffffffc080ccb000 dma = 0x00000000de400000 len=9024
+[    2.528660] FIQ FSM acceleration enabled for :
+               Non-periodic Split Transactions
+               Periodic Split Transactions
+               High-Speed Isochronous Endpoints
+               Interrupt/Control Split Transaction hack enabled
+[    2.531897] INFO:: MPHI regs_base at ffffffc080075000
+[    2.534482] Init: Port Power? op_state=1
+[    2.535083] Init: Power Port (0)
+[    3.947408] Indeed it is in host mode hprt0 = 00021501
+[    4.138487] Indeed it is in host mode hprt0 = 00001101
+[    4.166638] mmc0: host does not support reading read-only switch, assuming write-enable
+[   12.127928] snd_bcm2835: module is from the staging directory, the quality is unknown, you have been warned.
+[   12.377249] vc_sm_cma: module is from the staging directory, the quality is unknown, you have been warned.
+[   12.438436] bcm2835_mmal_vchiq: module is from the staging directory, the quality is unknown, you have been warned.
+[   12.501273] bcm2835_v4l2: module is from the staging directory, the quality is unknown, you have been warned.
+[   12.510453] bcm2835_isp: module is from the staging directory, the quality is unknown, you have been warned.
+[   12.513456] hci_uart_bcm serial0-0: supply vbat not found, using dummy regulator
+[   12.513725] hci_uart_bcm serial0-0: supply vddio not found, using dummy regulator
+[   12.550295] bcm2835_codec: module is from the staging directory, the quality is unknown, you have been warned.
+
+========== END ==========
+Diagnostics complete. No Wi-Fi passwords, SSH keys, or configuration secrets were requested.
