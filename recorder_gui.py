@@ -110,6 +110,10 @@ class RecorderGUI:
         self.audio_send_process = None
         self.audio_send_thread = None
         self.audio_send_stop_event = threading.Event()
+        self.audio_send_generation = 0
+        self.audio_send_targets = []
+        self.audio_send_queues = {}
+        self.audio_send_post_threads = []
         self.audio_send_source_options = []
         self.audio_send_source_map = {}
         self.audio_send_level = 0.0
@@ -123,8 +127,8 @@ class RecorderGUI:
         self.audio_output_device = tk.StringVar(value="auto")
         self.audio_send_source = tk.StringVar(value="0" if sys.platform == "darwin" else "default")
         self.audio_send_status = tk.StringVar(value="Send idle")
-        self.audio_send_gain = tk.DoubleVar(value=1.0)
-        self.audio_send_gain_label = tk.StringVar(value="1.0x")
+        self.audio_send_gain = tk.DoubleVar(value=2.0)
+        self.audio_send_gain_label = tk.StringVar(value="2.0x")
         self.erase_freq = tk.StringVar(value=ERASE_FREQ_OPTIONS[0])
         self.clip_status = tk.StringVar(value="Clip idle")
 
@@ -273,32 +277,12 @@ class RecorderGUI:
             command=self.test_manual_host,
         ).pack(side=tk.LEFT, padx=3)
 
-        # Power / mode commands
-        power_frame = ttk.LabelFrame(main, text="Power and mode", padding=10)
+        # Transport commands
+        power_frame = ttk.LabelFrame(main, text="Transport", padding=10)
         power_frame.pack(fill=tk.X, pady=(10, 0))
 
-        ttk.Button(power_frame, text="Power ON", command=lambda: self.command("/power/on")).pack(side=tk.LEFT, padx=3)
-        ttk.Button(power_frame, text="Power OFF", command=lambda: self.command("/power/off")).pack(side=tk.LEFT, padx=3)
         ttk.Button(power_frame, text="Play", command=lambda: self.command("/play")).pack(side=tk.LEFT, padx=3)
         ttk.Button(power_frame, text="Record", command=lambda: self.command(RECORD_PATH)).pack(side=tk.LEFT, padx=3)
-        ttk.Button(power_frame, text="Status", command=lambda: self.command("/status")).pack(side=tk.LEFT, padx=3)
-
-        # Erase commands
-        erase_frame = ttk.LabelFrame(main, text="Erase", padding=10)
-        erase_frame.pack(fill=tk.X, pady=(10, 0))
-
-        ttk.Label(erase_frame, text="Freq:").pack(side=tk.LEFT, padx=3)
-
-        ttk.Combobox(
-            erase_frame,
-            textvariable=self.erase_freq,
-            values=ERASE_FREQ_OPTIONS,
-            width=8,
-            state="readonly",
-        ).pack(side=tk.LEFT, padx=3)
-
-        ttk.Button(erase_frame, text="Erase ON", command=self.erase_on).pack(side=tk.LEFT, padx=3)
-        ttk.Button(erase_frame, text="Erase OFF", command=lambda: self.command("/erase/off")).pack(side=tk.LEFT, padx=3)
 
         # Motor commands
         motor_frame = ttk.LabelFrame(main, text="Motor", padding=10)
@@ -384,9 +368,7 @@ class RecorderGUI:
         ).pack(side=tk.LEFT, padx=3)
         ttk.Label(send_frame, textvariable=self.audio_send_gain_label, width=5).pack(side=tk.LEFT, padx=3)
 
-        ttk.Button(send_frame, text="Start Send", command=self.start_audio_send).pack(side=tk.LEFT, padx=3)
-        ttk.Button(send_frame, text="Stop Send", command=self.stop_audio_send).pack(side=tk.LEFT, padx=3)
-        ttk.Button(send_frame, text="List Local Inputs", command=self.list_local_audio_sources).pack(side=tk.LEFT, padx=3)
+        ttk.Label(send_frame, text="Volume:").pack(side=tk.LEFT, padx=3)
         self.audio_send_meter = tk.Canvas(
             send_frame,
             width=112,
@@ -531,11 +513,19 @@ class RecorderGUI:
                         self.stop_clip_recording()
 
                 elif event == "audio_send_stopped":
+                    generation, message = payload
+
+                    if generation != self.audio_send_generation:
+                        continue
+
                     self.audio_send_running = False
                     self.audio_send_process = None
+                    self.audio_send_targets = []
+                    self.audio_send_queues = {}
+                    self.audio_send_post_threads = []
                     self.audio_send_level = 0.0
-                    self.audio_send_status.set(payload)
-                    self.log(f"[AUDIO SEND] {payload}")
+                    self.audio_send_status.set(message)
+                    self.log(f"[AUDIO SEND] {message}")
 
                 elif event == "audio_send_sources":
                     self.set_audio_send_sources(payload)
@@ -717,6 +707,7 @@ class RecorderGUI:
             return
 
         self.apply_command_state(base_urls, path)
+        self.apply_audio_send_command_state(base_urls, path)
 
         thread = threading.Thread(
             target=self._request_group_worker,
@@ -724,6 +715,14 @@ class RecorderGUI:
             daemon=True,
         )
         thread.start()
+
+    def apply_audio_send_command_state(self, base_urls, path):
+        command_path = urlsplit(path).path
+
+        if command_path == RECORD_PATH:
+            self.start_audio_send(base_urls)
+        elif command_path in ["/play", "/power/off"]:
+            self.stop_audio_send()
 
     def build_url_for(self, base_url, path):
         if not path.startswith("/"):
@@ -1053,18 +1052,18 @@ class RecorderGUI:
         except Exception as e:
             self.event_queue.put(("debug", f"[AUDIO SEND] List inputs failed: {type(e).__name__}: {e}"))
 
-    def start_audio_send(self):
+    def start_audio_send(self, base_urls=None):
         if self.audio_send_running:
-            self.log("[AUDIO SEND] Already sending")
-            return
+            new_targets = sorted(set(base_urls or self.get_selected_base_urls()))
+
+            if new_targets == sorted(self.audio_send_targets):
+                self.log(f"[AUDIO SEND] Already sending to {len(new_targets)} recorder(s)")
+                return
+
+            self.stop_audio_send(quiet=True)
 
         try:
-            base_urls = self.get_selected_base_urls()
-            base_url = base_urls[0]
-
-            if len(base_urls) > 1:
-                self.log(f"[AUDIO SEND] Using first selected recorder: {base_url}")
-
+            target_urls = sorted(set(base_urls or self.get_selected_base_urls()))
             cmd = self.choose_audio_send_command()
 
         except Exception as e:
@@ -1072,10 +1071,6 @@ class RecorderGUI:
             return
 
         output_device = quote(self.audio_output_device.get().strip() or "auto", safe="")
-        post_url = self.build_url_for(
-            base_url,
-            f"/audio/playback?device={output_device}&rate={AUDIO_RATE}&channels={AUDIO_CHANNELS}",
-        )
 
         try:
             proc = subprocess.Popen(
@@ -1089,27 +1084,77 @@ class RecorderGUI:
             self.log(f"[AUDIO SEND] Could not start local capture: {type(e).__name__}: {e}")
             return
 
-        self.audio_send_stop_event = threading.Event()
+        self.audio_send_generation += 1
+        generation = self.audio_send_generation
+        stop_event = threading.Event()
+        self.audio_send_stop_event = stop_event
         self.audio_send_process = proc
+        self.audio_send_targets = target_urls
+        queues = {
+            base_url: queue.Queue(maxsize=32)
+            for base_url in target_urls
+        }
+        self.audio_send_queues = queues
+        self.audio_send_post_threads = []
         self.audio_send_running = True
-        self.audio_send_status.set("Sending")
-        self.log(f"[AUDIO SEND] POST {post_url}")
+        self.audio_send_status.set(f"Sending {len(target_urls)}")
         self.log(f"[AUDIO SEND] Capture command: {' '.join(cmd)}")
+        self.log(f"[AUDIO SEND] Sending to {len(target_urls)} recorder(s)")
+
+        for base_url in target_urls:
+            post_url = self.build_url_for(
+                base_url,
+                f"/audio/playback?device={output_device}&rate={AUDIO_RATE}&channels={AUDIO_CHANNELS}",
+            )
+            self.log(f"[AUDIO SEND] POST {post_url}")
+
+            post_thread = threading.Thread(
+                target=self._audio_send_post_worker,
+                args=(generation, base_url, post_url, queues[base_url], stop_event),
+                daemon=True,
+            )
+            self.audio_send_post_threads.append(post_thread)
+            post_thread.start()
 
         self.audio_send_thread = threading.Thread(
-            target=self._audio_send_worker,
-            args=(proc, post_url),
+            target=self._audio_send_capture_worker,
+            args=(generation, proc, queues, stop_event),
             daemon=True,
         )
         self.audio_send_thread.start()
 
-    def _audio_send_worker(self, proc, post_url):
+    def enqueue_audio_send_chunk(self, chunk, queues, stop_event):
+        for target_queue in list(queues.values()):
+            if stop_event.is_set():
+                return
+
+            try:
+                target_queue.put(chunk, timeout=0.1)
+            except queue.Full:
+                try:
+                    target_queue.get_nowait()
+                    target_queue.put_nowait(chunk)
+                except Exception:
+                    pass
+
+    def finish_audio_send_queues(self, queues=None):
+        target_queues = queues or self.audio_send_queues
+
+        for target_queue in list(target_queues.values()):
+            try:
+                target_queue.put_nowait(None)
+            except queue.Full:
+                try:
+                    target_queue.get_nowait()
+                    target_queue.put_nowait(None)
+                except Exception:
+                    pass
+
+    def _audio_send_capture_worker(self, generation, proc, queues, stop_event):
         total_bytes = 0
 
-        def generate():
-            nonlocal total_bytes
-
-            while not self.audio_send_stop_event.is_set():
+        try:
+            while not stop_event.is_set():
                 chunk = proc.stdout.read(AUDIO_CHUNK_BYTES)
 
                 if not chunk:
@@ -1120,33 +1165,15 @@ class RecorderGUI:
 
                 total_bytes += len(output_chunk)
                 self.audio_send_level = self.pcm_level(self.pcm_samples(output_chunk))
-                yield output_chunk
-
-        try:
-            response = requests.post(
-                post_url,
-                data=generate(),
-                headers={"Content-Type": "application/octet-stream"},
-                timeout=(REQUEST_TIMEOUT, 3600),
-            )
-
-            message = f"Stopped HTTP {response.status_code}, bytes={total_bytes}"
-
-            try:
-                data = response.json()
-                message += f"\n{json.dumps(data, indent=2, sort_keys=True)}"
-            except Exception:
-                if response.text:
-                    message += f"\n{response.text[:1000]}"
-
-            self.event_queue.put(("debug", f"[AUDIO SEND] {message}"))
+                self.enqueue_audio_send_chunk(output_chunk, queues, stop_event)
 
         except Exception as e:
-            if not self.audio_send_stop_event.is_set():
-                self.event_queue.put(("debug", f"[AUDIO SEND] Error: {type(e).__name__}: {e}"))
+            if not stop_event.is_set():
+                self.event_queue.put(("debug", f"[AUDIO SEND] Capture error: {type(e).__name__}: {e}"))
 
         finally:
-            self.audio_send_stop_event.set()
+            stop_event.set()
+            self.finish_audio_send_queues(queues)
 
             if proc.poll() is None:
                 proc.terminate()
@@ -1167,7 +1194,48 @@ class RecorderGUI:
             if stderr:
                 self.event_queue.put(("debug", f"[AUDIO SEND] Capture stderr:\n{stderr[-2000:]}"))
 
-            self.event_queue.put(("audio_send_stopped", f"Send idle ({total_bytes} bytes)"))
+            self.event_queue.put(("audio_send_stopped", (generation, f"Send idle ({total_bytes} bytes)")))
+
+    def _audio_send_post_worker(self, generation, base_url, post_url, target_queue, stop_event):
+        total_bytes = 0
+
+        def generate():
+            nonlocal total_bytes
+
+            while not stop_event.is_set():
+                try:
+                    chunk = target_queue.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+
+                if chunk is None:
+                    break
+
+                total_bytes += len(chunk)
+                yield chunk
+
+        try:
+            response = requests.post(
+                post_url,
+                data=generate(),
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=(REQUEST_TIMEOUT, 3600),
+            )
+
+            message = f"{base_url} stopped HTTP {response.status_code}, bytes={total_bytes}"
+
+            try:
+                data = response.json()
+                message += f"\n{json.dumps(data, indent=2, sort_keys=True)}"
+            except Exception:
+                if response.text:
+                    message += f"\n{response.text[:1000]}"
+
+            self.event_queue.put(("debug", f"[AUDIO SEND] {message}"))
+
+        except Exception as e:
+            if not stop_event.is_set():
+                self.event_queue.put(("debug", f"[AUDIO SEND] {base_url} error: {type(e).__name__}: {e}"))
 
     def stop_audio_send(self, quiet=False):
         if not self.audio_send_running:
@@ -1180,6 +1248,8 @@ class RecorderGUI:
 
         if self.audio_send_process and self.audio_send_process.poll() is None:
             self.audio_send_process.terminate()
+
+        self.finish_audio_send_queues()
 
         if not quiet:
             self.log("[AUDIO SEND] Stopping")
