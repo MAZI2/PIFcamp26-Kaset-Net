@@ -201,6 +201,36 @@ def print_spectral_peaks(audio, rate, label):
         print(f"  {freq:8.1f} Hz  magnitude={magnitude:.1f}")
 
 
+def detect_tone_peaks(audio, rate, count=8, min_hz=70.0, max_hz=6000.0, min_spacing_hz=6.0):
+    mono = np.mean(audio, axis=1)
+    size = min(len(mono), rate * 8)
+    window = mono[:size] * np.hanning(size)
+    spectrum = np.abs(np.fft.rfft(window))
+    freqs = np.fft.rfftfreq(size, 1.0 / rate)
+
+    mask = (freqs >= min_hz) & (freqs <= max_hz)
+    masked_freqs = freqs[mask]
+    masked_spectrum = spectrum[mask]
+
+    peak_indexes, _ = signal.find_peaks(masked_spectrum)
+    candidates = sorted(
+        [(masked_freqs[index], masked_spectrum[index]) for index in peak_indexes],
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    selected = []
+
+    for freq, _magnitude in candidates:
+        if all(abs(freq - existing) >= min_spacing_hz for existing in selected):
+            selected.append(float(freq))
+
+        if len(selected) >= count:
+            break
+
+    return selected
+
+
 def process(input_path, output_dir):
     rate, original = read_audio(input_path)
     report("original", original, rate)
@@ -230,7 +260,12 @@ def process(input_path, output_dir):
     report("08 despike gate", declicked, rate)
     write_audio(output_dir / "08_despike_spectral_gate.wav", rate, normalize_headroom(declicked))
 
-    targeted = notch_many(base, rate, [150.5, 495.0, 590.0], quality=18.0)
+    detected_tones = detect_tone_peaks(base, rate)
+    print("\nDetected notch targets:")
+    for freq in detected_tones:
+        print(f"  {freq:.1f} Hz")
+
+    targeted = notch_many(base, rate, detected_tones, quality=22.0)
     targeted = butter_filter(targeted, rate, 8000.0, "lowpass")
     report("09 targeted tones", targeted, rate)
     write_audio(output_dir / "09_targeted_tone_notches.wav", rate, normalize_headroom(targeted))
@@ -238,7 +273,7 @@ def process(input_path, output_dir):
     repaired = soften_clipped_samples(original)
     repaired = remove_dc(repaired)
     repaired = butter_filter(repaired, rate, 60.0, "highpass")
-    repaired = notch_many(repaired, rate, [150.5, 495.0, 590.0], quality=18.0)
+    repaired = notch_many(repaired, rate, detected_tones, quality=22.0)
     repaired = despike(repaired, threshold=0.12)
     repaired = spectral_gate(repaired, rate, strength=0.78, min_gain=0.16, quiet_percentile=25)
     report("10 repaired aggressive", repaired, rate)

@@ -105,6 +105,10 @@ class RecorderGUI:
         self.mixer_sources = {}
         self.mixer_rows = {}
         self.mixer_lock = threading.Lock()
+        self.audio_send_running = False
+        self.audio_send_process = None
+        self.audio_send_thread = None
+        self.audio_send_stop_event = threading.Event()
         self.clip_lock = threading.Lock()
         self.clip_recording = False
         self.clip_started_at = None
@@ -112,6 +116,9 @@ class RecorderGUI:
 
         self.manual_host = tk.StringVar(value="192.168.0.9")
         self.audio_device = tk.StringVar(value="auto")
+        self.audio_output_device = tk.StringVar(value="auto")
+        self.audio_send_source = tk.StringVar(value="0" if sys.platform == "darwin" else "default")
+        self.audio_send_status = tk.StringVar(value="Send idle")
         self.erase_freq = tk.StringVar(value=ERASE_FREQ_OPTIONS[0])
         self.clip_status = tk.StringVar(value="Clip idle")
 
@@ -340,6 +347,28 @@ class RecorderGUI:
         self.mixer_rows_frame = ttk.Frame(audio_frame)
         self.mixer_rows_frame.pack(fill=tk.X, pady=(8, 0))
 
+        send_frame = ttk.Frame(audio_frame)
+        send_frame.pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Label(send_frame, text="Send source:").pack(side=tk.LEFT, padx=3)
+        ttk.Entry(
+            send_frame,
+            textvariable=self.audio_send_source,
+            width=12,
+        ).pack(side=tk.LEFT, padx=3)
+
+        ttk.Label(send_frame, text="Pi output:").pack(side=tk.LEFT, padx=3)
+        ttk.Entry(
+            send_frame,
+            textvariable=self.audio_output_device,
+            width=14,
+        ).pack(side=tk.LEFT, padx=3)
+
+        ttk.Button(send_frame, text="Start Send", command=self.start_audio_send).pack(side=tk.LEFT, padx=3)
+        ttk.Button(send_frame, text="Stop Send", command=self.stop_audio_send).pack(side=tk.LEFT, padx=3)
+        ttk.Button(send_frame, text="List Local Inputs", command=self.list_local_audio_sources).pack(side=tk.LEFT, padx=3)
+        ttk.Label(send_frame, textvariable=self.audio_send_status, width=16).pack(side=tk.LEFT, padx=6)
+
         # Quick command entry
         custom_frame = ttk.LabelFrame(main, text="Custom endpoint", padding=10)
         custom_frame.pack(fill=tk.X, pady=(10, 0))
@@ -472,6 +501,12 @@ class RecorderGUI:
 
                     if self.clip_recording:
                         self.stop_clip_recording()
+
+                elif event == "audio_send_stopped":
+                    self.audio_send_running = False
+                    self.audio_send_process = None
+                    self.audio_send_status.set(payload)
+                    self.log(f"[AUDIO SEND] {payload}")
 
         except queue.Empty:
             pass
@@ -780,6 +815,238 @@ class RecorderGUI:
             ]
 
         raise RuntimeError("No audio player found. Install ffmpeg/ffplay on macOS or alsa-utils/aplay on Linux.")
+
+    def choose_audio_send_command(self):
+        source = self.audio_send_source.get().strip()
+        ffmpeg = shutil.which("ffmpeg")
+        arecord = shutil.which("arecord")
+
+        if sys.platform == "darwin":
+            if not ffmpeg:
+                raise RuntimeError("ffmpeg not found. Install ffmpeg to capture macOS audio.")
+
+            if not source:
+                source = "0"
+
+            return [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel", "warning",
+                "-f", "avfoundation",
+                "-i", f":{source}",
+                "-ac", str(AUDIO_CHANNELS),
+                "-ar", str(AUDIO_RATE),
+                "-f", "s16le",
+                "pipe:1",
+            ]
+
+        if sys.platform.startswith("linux") and arecord:
+            if not source:
+                source = "default"
+
+            return [
+                arecord,
+                "-q",
+                "-D", source,
+                "-f", "S16_LE",
+                "-r", str(AUDIO_RATE),
+                "-c", str(AUDIO_CHANNELS),
+                "-t", "raw",
+            ]
+
+        if ffmpeg:
+            if not source:
+                source = "default"
+
+            return [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel", "warning",
+                "-f", "alsa",
+                "-i", source,
+                "-ac", str(AUDIO_CHANNELS),
+                "-ar", str(AUDIO_RATE),
+                "-f", "s16le",
+                "pipe:1",
+            ]
+
+        raise RuntimeError("No local audio capture tool found. Install ffmpeg or alsa-utils.")
+
+    def list_local_audio_sources(self):
+        thread = threading.Thread(target=self._list_local_audio_sources_worker, daemon=True)
+        thread.start()
+
+    def _list_local_audio_sources_worker(self):
+        try:
+            if sys.platform == "darwin":
+                ffmpeg = shutil.which("ffmpeg")
+
+                if not ffmpeg:
+                    self.event_queue.put(("debug", "[AUDIO SEND] ffmpeg not found"))
+                    return
+
+                result = subprocess.run(
+                    [
+                        ffmpeg,
+                        "-hide_banner",
+                        "-f", "avfoundation",
+                        "-list_devices", "true",
+                        "-i", "",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    check=False,
+                )
+
+                output = (result.stderr or result.stdout or "").strip()
+                self.event_queue.put(("debug", f"[AUDIO SEND] Local macOS inputs:\n{output[-4000:]}"))
+                return
+
+            arecord = shutil.which("arecord")
+
+            if arecord:
+                result = subprocess.run(
+                    [arecord, "-L"],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    check=False,
+                )
+                self.event_queue.put(("debug", f"[AUDIO SEND] Local ALSA inputs:\n{result.stdout.strip()[-4000:]}"))
+                return
+
+            self.event_queue.put(("debug", "[AUDIO SEND] No local input lister found"))
+
+        except Exception as e:
+            self.event_queue.put(("debug", f"[AUDIO SEND] List inputs failed: {type(e).__name__}: {e}"))
+
+    def start_audio_send(self):
+        if self.audio_send_running:
+            self.log("[AUDIO SEND] Already sending")
+            return
+
+        try:
+            base_urls = self.get_selected_base_urls()
+            base_url = base_urls[0]
+
+            if len(base_urls) > 1:
+                self.log(f"[AUDIO SEND] Using first selected recorder: {base_url}")
+
+            cmd = self.choose_audio_send_command()
+
+        except Exception as e:
+            self.log(f"[AUDIO SEND] {e}")
+            return
+
+        output_device = quote(self.audio_output_device.get().strip() or "auto", safe="")
+        post_url = self.build_url_for(
+            base_url,
+            f"/audio/playback?device={output_device}&rate={AUDIO_RATE}&channels={AUDIO_CHANNELS}",
+        )
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+
+        except Exception as e:
+            self.log(f"[AUDIO SEND] Could not start local capture: {type(e).__name__}: {e}")
+            return
+
+        self.audio_send_stop_event = threading.Event()
+        self.audio_send_process = proc
+        self.audio_send_running = True
+        self.audio_send_status.set("Sending")
+        self.log(f"[AUDIO SEND] POST {post_url}")
+        self.log(f"[AUDIO SEND] Capture command: {' '.join(cmd)}")
+
+        self.audio_send_thread = threading.Thread(
+            target=self._audio_send_worker,
+            args=(proc, post_url),
+            daemon=True,
+        )
+        self.audio_send_thread.start()
+
+    def _audio_send_worker(self, proc, post_url):
+        total_bytes = 0
+
+        def generate():
+            nonlocal total_bytes
+
+            while not self.audio_send_stop_event.is_set():
+                chunk = proc.stdout.read(AUDIO_CHUNK_BYTES)
+
+                if not chunk:
+                    break
+
+                total_bytes += len(chunk)
+                yield chunk
+
+        try:
+            response = requests.post(
+                post_url,
+                data=generate(),
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=(REQUEST_TIMEOUT, 3600),
+            )
+
+            message = f"Stopped HTTP {response.status_code}, bytes={total_bytes}"
+
+            try:
+                data = response.json()
+                message += f"\n{json.dumps(data, indent=2, sort_keys=True)}"
+            except Exception:
+                if response.text:
+                    message += f"\n{response.text[:1000]}"
+
+            self.event_queue.put(("debug", f"[AUDIO SEND] {message}"))
+
+        except Exception as e:
+            if not self.audio_send_stop_event.is_set():
+                self.event_queue.put(("debug", f"[AUDIO SEND] Error: {type(e).__name__}: {e}"))
+
+        finally:
+            self.audio_send_stop_event.set()
+
+            if proc.poll() is None:
+                proc.terminate()
+
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+            stderr = ""
+
+            try:
+                if proc.stderr:
+                    stderr = proc.stderr.read().decode(errors="replace").strip()
+            except Exception:
+                stderr = ""
+
+            if stderr:
+                self.event_queue.put(("debug", f"[AUDIO SEND] Capture stderr:\n{stderr[-2000:]}"))
+
+            self.event_queue.put(("audio_send_stopped", f"Send idle ({total_bytes} bytes)"))
+
+    def stop_audio_send(self, quiet=False):
+        if not self.audio_send_running:
+            if not quiet:
+                self.log("[AUDIO SEND] Not sending")
+            return
+
+        self.audio_send_status.set("Stopping")
+        self.audio_send_stop_event.set()
+
+        if self.audio_send_process and self.audio_send_process.poll() is None:
+            self.audio_send_process.terminate()
+
+        if not quiet:
+            self.log("[AUDIO SEND] Stopping")
 
     def create_mixer_row(self, base_url, source):
         row = ttk.Frame(self.mixer_rows_frame)
@@ -1258,6 +1525,7 @@ class RecorderGUI:
                 pass
 
         self.stop_audio_monitor(quiet=True)
+        self.stop_audio_send(quiet=True)
 
         self.root.destroy()
 
