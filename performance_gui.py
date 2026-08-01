@@ -35,6 +35,15 @@ AUDIO_CHANNELS = 1
 AUDIO_CHUNK_BYTES = 4096
 AUDIO_SOURCE_BUFFER_MAX_BYTES = AUDIO_RATE * AUDIO_CHANNELS * 2
 AUDIO_LEVEL_DOTS = 26
+AUDIO_LOOP_BUFFER_SECONDS = 90
+AUDIO_LOOP_BUFFER_MAX_BYTES = AUDIO_RATE * AUDIO_CHANNELS * 2 * AUDIO_LOOP_BUFFER_SECONDS
+LOOP_ANALYSIS_INTERVAL_SECONDS = 4.0
+LOOP_ANALYSIS_SECONDS = 60
+LOOP_MIN_SECONDS = 1.5
+LOOP_MAX_SECONDS = 45.0
+LOOP_ENVELOPE_FRAME_SECONDS = 0.10
+HEALTH_CHECK_INTERVAL_SECONDS = 5.0
+HEALTH_REQUEST_TIMEOUT = 2.0
 
 REFERENCE_WIDTH = 1680
 REFERENCE_HEIGHT = 945
@@ -77,6 +86,7 @@ class RecorderDevice:
     online: bool = True
     monitor_volume: float = 1.0
     monitor_muted: bool = False
+    last_seen: float = 0.0
 
 
 class RecorderDiscovery(ServiceListener):
@@ -347,7 +357,14 @@ class PerformanceCanvas:
         mode = dev.mode.upper() if dev else "--"
         reverse = "REV" if dev and dev.reverse else "FWD"
         state = "ON" if dev and dev.online else "--"
-        self.text(left + 10, 802, f"Online: {state}\nMode:   {mode}\nSpeed:  {speed} {reverse}", size=14, fill=GREEN if dev else DIM)
+        loop_info = self.gui.loop_status(dev)
+        self.text(
+            left + 10,
+            801,
+            f"Online: {state}\nMode:   {mode}\nSpeed:  {speed} {reverse}\n{loop_info}",
+            size=12,
+            fill=GREEN if dev else DIM,
+        )
         self.dot(right - 18, 808, radius=6, fill=GREEN if dev and dev.online else RED_DARK)
 
     def draw_master(self):
@@ -440,6 +457,7 @@ class PerformanceGUI:
         self.mixer_thread = None
         self.mixer_sources = {}
         self.mixer_lock = threading.Lock()
+        self.health_check_running = False
 
         self.audio_send_running = False
         self.audio_send_process = None
@@ -496,6 +514,7 @@ class PerformanceGUI:
         self.root.after(100, self.process_events)
         self.root.after(100, self.update_meters)
         self.root.after(500, self.list_local_audio_sources)
+        self.root.after(1000, self.poll_device_health)
 
     def build_overlay_widgets(self):
         style = ttk.Style(self.root)
@@ -603,8 +622,14 @@ class PerformanceGUI:
             existing.name = name or existing.name
             existing.ip = ip
             existing.online = True
+            existing.last_seen = time.time()
         else:
-            self.devices[url] = RecorderDevice(name=name or "Recorder", url=url, ip=ip)
+            self.devices[url] = RecorderDevice(
+                name=name or "Recorder",
+                url=url,
+                ip=ip,
+                last_seen=time.time(),
+            )
 
         if not self.selected_urls:
             self.selected_urls.add(url)
@@ -657,6 +682,21 @@ class PerformanceGUI:
                     base_url, data = payload
                     self.update_device_from_status(base_url, data)
 
+                elif event == "device_offline":
+                    base_url, message = payload
+                    dev = self.devices.get(base_url)
+
+                    if dev and dev.online:
+                        dev.online = False
+                        self.log(message)
+
+                    self.sync_mixer_sources()
+                    self.sync_record_audio_send()
+                    self.redraw()
+
+                elif event == "health_done":
+                    self.health_check_running = False
+
                 elif event == "audio_send_sources":
                     self.set_audio_send_sources(payload)
 
@@ -694,13 +734,18 @@ class PerformanceGUI:
             dev.mode = mode
 
         if speed is not None:
-            dev.speed = int(speed)
+            new_speed = int(speed)
+
+            if new_speed != dev.speed:
+                dev.speed = new_speed
+                self.mark_speed_change(base_url)
 
         if reverse is not None:
             dev.reverse = bool(reverse)
 
         dev.erase = bool(data.get("erase", False))
         dev.online = True
+        dev.last_seen = time.time()
         self.sync_mixer_sources()
         self.redraw()
 
@@ -746,7 +791,9 @@ class PerformanceGUI:
             elif command_path == RECORD_PATH:
                 dev.mode = "record"
             elif command_path == "/stop":
-                dev.speed = 0
+                if dev.speed != 0:
+                    dev.speed = 0
+                    self.mark_speed_change(url)
             elif command_path == "/reverse/on":
                 dev.reverse = True
             elif command_path == "/reverse/off":
@@ -756,10 +803,25 @@ class PerformanceGUI:
                 match = re.search(r"(?:^|&)speed=(\d+)", query)
 
                 if match:
-                    dev.speed = int(match.group(1))
+                    new_speed = int(match.group(1))
+
+                    if new_speed != dev.speed:
+                        dev.speed = new_speed
+                        self.mark_speed_change(url)
 
         self.redraw()
         self.sync_mixer_sources()
+
+    def mark_speed_change(self, base_url):
+        with self.mixer_lock:
+            source = self.mixer_sources.get(base_url)
+
+        if not source:
+            return
+
+        with source["lock"]:
+            source["analysis_start_bytes"] = source.get("input_bytes", 0)
+            source["last_analysis_at"] = 0.0
 
     def request_async(self, urls, path):
         thread = threading.Thread(
@@ -816,11 +878,46 @@ class PerformanceGUI:
         for worker in workers:
             worker.join()
 
+    def poll_device_health(self):
+        if self.devices and not self.health_check_running:
+            self.health_check_running = True
+            urls = list(self.devices)
+            thread = threading.Thread(target=self._health_check_worker, args=(urls,), daemon=True)
+            thread.start()
+
+        self.root.after(int(HEALTH_CHECK_INTERVAL_SECONDS * 1000), self.poll_device_health)
+
+    def _health_check_worker(self, urls):
+        try:
+            for base_url in urls:
+                if base_url not in self.devices:
+                    continue
+
+                status_url = self.build_url_for(base_url, "/status")
+
+                try:
+                    response = requests.get(status_url, timeout=HEALTH_REQUEST_TIMEOUT)
+                    response.raise_for_status()
+                    data = response.json()
+                    self.event_queue.put(("status_update", (base_url, data)))
+
+                except Exception as e:
+                    self.event_queue.put((
+                        "device_offline",
+                        (base_url, f"[HEALTH] Offline {base_url}: {type(e).__name__}"),
+                    ))
+
+        finally:
+            self.event_queue.put(("health_done", None))
+
     def playable_mixer_urls(self):
         return [
             dev.url for dev in self.ordered_devices()
             if dev.online and dev.mode == "play"
         ]
+
+    def active_mixer_urls(self):
+        return [dev.url for dev in self.ordered_devices()]
 
     def choose_playback_command(self):
         aplay = shutil.which("aplay")
@@ -863,39 +960,68 @@ class PerformanceGUI:
 
         raise RuntimeError("No audio playback tool found. Install ffmpeg/ffplay on macOS or alsa-utils/aplay on Linux.")
 
+    def new_mixer_source(self, base_url):
+        return {
+            "url": base_url,
+            "queue": queue.Queue(maxsize=64),
+            "buffer": bytearray(),
+            "loop_buffer": bytearray(),
+            "loop_buffer_start_bytes": 0,
+            "buffer_playhead": 0,
+            "input_bytes": 0,
+            "playout_bytes": 0,
+            "capture_speed": 0,
+            "capture_loop_seconds": 0.0,
+            "speed_loop_measurements": {},
+            "buffer_rate": 1.0,
+            "stop_event": threading.Event(),
+            "thread": None,
+            "level": 0.0,
+            "kind": "idle",
+            "loop_seconds": 0.0,
+            "loop_confidence": 0.0,
+            "last_audio_at": 0.0,
+            "last_analysis_at": 0.0,
+            "analysis_start_bytes": 0,
+            "lock": threading.Lock(),
+        }
+
     def sync_mixer_sources(self):
-        playable_urls = set(self.playable_mixer_urls())
+        active_urls = set(self.active_mixer_urls())
 
         with self.mixer_lock:
             for base_url in list(self.mixer_sources):
-                if base_url not in playable_urls:
+                if base_url not in active_urls:
                     self.stop_mixer_source(self.mixer_sources[base_url])
                     del self.mixer_sources[base_url]
 
-            for base_url in playable_urls:
+            for base_url in active_urls:
                 if base_url not in self.mixer_sources:
-                    self.mixer_sources[base_url] = {
-                        "url": base_url,
-                        "queue": queue.Queue(maxsize=64),
-                        "buffer": bytearray(),
-                        "stop_event": threading.Event(),
-                        "thread": None,
-                        "level": 0.0,
-                    }
+                    self.mixer_sources[base_url] = self.new_mixer_source(base_url)
 
             sources = list(self.mixer_sources.items())
+            should_run = any(
+                dev.online
+                for dev in self.ordered_devices()
+                if dev.url in self.mixer_sources
+            )
 
-        if sources and not self.mixer_running:
+        if should_run and not self.mixer_running:
             self.start_audio_monitor()
             return
 
-        if not sources and self.mixer_running:
+        if not should_run and self.mixer_running:
             self.stop_audio_monitor(quiet=True)
             return
 
         if self.mixer_running:
             for base_url, source in sources:
-                self.start_mixer_source(base_url, source)
+                dev = self.devices.get(base_url)
+
+                if dev and dev.online and dev.mode == "play":
+                    self.start_mixer_source(base_url, source)
+                else:
+                    self.stop_mixer_source(source)
 
     def start_audio_monitor(self):
         if self.mixer_running:
@@ -918,7 +1044,10 @@ class PerformanceGUI:
         self.log(f"[MIXER] Starting automatic output via {backend}")
 
         for base_url, source in sources:
-            self.start_mixer_source(base_url, source)
+            dev = self.devices.get(base_url)
+
+            if dev and dev.online and dev.mode == "play":
+                self.start_mixer_source(base_url, source)
 
         self.mixer_thread = threading.Thread(
             target=self._mixer_worker,
@@ -952,6 +1081,213 @@ class PerformanceGUI:
             stop_event.set()
 
         source["level"] = 0.0
+        source["kind"] = "idle"
+
+    def append_loop_buffer(self, source, chunk, speed=0):
+        if not chunk:
+            return
+
+        if len(chunk) % 2:
+            chunk = chunk[:-1]
+
+        with source["lock"]:
+            loop_buffer = source.setdefault("loop_buffer", bytearray())
+            loop_buffer.extend(chunk)
+            source["input_bytes"] = source.get("input_bytes", 0) + len(chunk)
+
+            if len(loop_buffer) > AUDIO_LOOP_BUFFER_MAX_BYTES:
+                del loop_buffer[:len(loop_buffer) - AUDIO_LOOP_BUFFER_MAX_BYTES]
+
+            source["loop_buffer_start_bytes"] = source.get("input_bytes", 0) - len(loop_buffer)
+            source["last_audio_at"] = time.time()
+
+            if speed > 0:
+                source["capture_speed"] = speed
+
+    def update_speed_loop_measurement(self, source, speed, loop_seconds, confidence):
+        if speed <= 0 or loop_seconds <= 0.0 or confidence < 0.20:
+            return
+
+        measurements = source.setdefault("speed_loop_measurements", {})
+        speed = int(speed)
+        existing = measurements.get(speed)
+
+        if existing:
+            measurements[speed] = existing * 0.80 + loop_seconds * 0.20
+        else:
+            measurements[speed] = loop_seconds
+
+        source["capture_speed"] = speed
+        source["capture_loop_seconds"] = loop_seconds
+
+    def measured_loop_seconds_for_speed(self, source, speed):
+        measurements = source.get("speed_loop_measurements", {})
+
+        if not measurements or speed <= 0:
+            return 0.0
+
+        speed = int(speed)
+
+        if speed in measurements:
+            return measurements[speed]
+
+        measured_speeds = sorted(measurements)
+
+        if len(measured_speeds) == 1:
+            return measurements[measured_speeds[0]]
+
+        lower = None
+        upper = None
+
+        for measured_speed in measured_speeds:
+            if measured_speed < speed:
+                lower = measured_speed
+            elif measured_speed > speed and upper is None:
+                upper = measured_speed
+
+        if lower is None:
+            lower = measured_speeds[0]
+            upper = measured_speeds[1]
+        elif upper is None:
+            lower = measured_speeds[-2]
+            upper = measured_speeds[-1]
+
+        if upper == lower:
+            return measurements[lower]
+
+        fraction = (speed - lower) / (upper - lower)
+        return measurements[lower] + (measurements[upper] - measurements[lower]) * fraction
+
+    def buffer_speed_ratio(self, source, dev):
+        current_speed = dev.speed if dev else 0
+
+        if current_speed <= 0:
+            return 0.0
+
+        target_loop_seconds = self.measured_loop_seconds_for_speed(source, current_speed)
+        capture_loop_seconds = source.get("capture_loop_seconds", 0.0) or source.get("loop_seconds", 0.0)
+
+        if target_loop_seconds <= 0.0 or capture_loop_seconds <= 0.0:
+            return 1.0
+
+        return clamp(capture_loop_seconds / target_loop_seconds, 0.25, 4.0)
+
+    def detected_loop_bytes(self, source, available_bytes):
+        detected_bytes = int(source.get("loop_seconds", 0.0) * AUDIO_RATE * AUDIO_CHANNELS * 2)
+        detected_bytes -= detected_bytes % 2
+
+        if detected_bytes > 0 and detected_bytes <= available_bytes:
+            return detected_bytes
+
+        return available_bytes - (available_bytes % 2)
+
+    def loop_buffer_seconds(self, source):
+        with source["lock"]:
+            return len(source.get("loop_buffer", b"")) / (AUDIO_RATE * AUDIO_CHANNELS * 2)
+
+    def loop_status(self, dev):
+        if not dev:
+            return "Loop:   --\nBuffer: --"
+
+        with self.mixer_lock:
+            source = self.mixer_sources.get(dev.url)
+
+        if not source:
+            return "Loop:   --\nBuffer: --"
+
+        buffer_seconds = self.loop_buffer_seconds(source)
+        loop_seconds = source.get("loop_seconds", 0.0)
+        confidence = source.get("loop_confidence", 0.0)
+        kind = source.get("kind", "idle")
+
+        if loop_seconds > 0.0:
+            loop_label = f"{loop_seconds:4.1f}s {confidence * 100:02.0f}%"
+        else:
+            loop_label = "--"
+
+        return f"Loop:   {loop_label}\nBuffer: {buffer_seconds:4.1f}s {kind}"
+
+    def maybe_analyze_loop(self, source, dev=None):
+        now = time.time()
+
+        if now - source.get("last_analysis_at", 0.0) < LOOP_ANALYSIS_INTERVAL_SECONDS:
+            return
+
+        source["last_analysis_at"] = now
+
+        with source["lock"]:
+            loop_buffer = source.get("loop_buffer", b"")
+            buffer_start = source.get("loop_buffer_start_bytes", 0)
+            analysis_start = source.get("analysis_start_bytes", 0)
+            offset = max(0, int(analysis_start - buffer_start))
+            raw = bytes(loop_buffer[offset:])
+
+        min_bytes = int(LOOP_MIN_SECONDS * AUDIO_RATE * AUDIO_CHANNELS * 2 * 2)
+
+        if len(raw) < min_bytes:
+            if not raw:
+                source["loop_seconds"] = 0.0
+                source["loop_confidence"] = 0.0
+            return
+
+        max_bytes = int(LOOP_ANALYSIS_SECONDS * AUDIO_RATE * AUDIO_CHANNELS * 2)
+        raw = raw[-max_bytes:]
+        samples = self.pcm_samples(raw)
+        frame_size = max(1, int(AUDIO_RATE * LOOP_ENVELOPE_FRAME_SECONDS))
+        envelope = []
+
+        for start in range(0, len(samples) - frame_size + 1, frame_size):
+            frame = samples[start:start + frame_size]
+            envelope.append(sum(abs(sample) for sample in frame) / frame_size)
+
+        if len(envelope) < 8:
+            return
+
+        mean = sum(envelope) / len(envelope)
+        envelope = [value - mean for value in envelope]
+        energy = sum(value * value for value in envelope)
+
+        if energy <= 0.0:
+            source["loop_seconds"] = 0.0
+            source["loop_confidence"] = 0.0
+            return
+
+        frame_seconds = LOOP_ENVELOPE_FRAME_SECONDS
+        min_lag = max(1, int(LOOP_MIN_SECONDS / frame_seconds))
+        max_lag = min(int(LOOP_MAX_SECONDS / frame_seconds), len(envelope) // 2)
+
+        if max_lag <= min_lag:
+            return
+
+        best_lag = 0
+        best_score = -1.0
+
+        for lag in range(min_lag, max_lag + 1):
+            left = envelope[:-lag]
+            right = envelope[lag:]
+            numerator = sum(a * b for a, b in zip(left, right))
+            left_energy = sum(value * value for value in left)
+            right_energy = sum(value * value for value in right)
+
+            if left_energy <= 0.0 or right_energy <= 0.0:
+                continue
+
+            score = numerator / math.sqrt(left_energy * right_energy)
+
+            if score > best_score:
+                best_score = score
+                best_lag = lag
+
+        if best_lag > 0 and best_score > 0.20:
+            loop_seconds = best_lag * frame_seconds
+            source["loop_seconds"] = loop_seconds
+            source["loop_confidence"] = clamp(best_score, 0.0, 1.0)
+
+            if dev and dev.mode == "play":
+                self.update_speed_loop_measurement(source, dev.speed, loop_seconds, source["loop_confidence"])
+        else:
+            source["loop_seconds"] = 0.0
+            source["loop_confidence"] = 0.0
 
     def _audio_stream_worker(self, base_url, source):
         stream_url = self.build_url_for(base_url, "/audio/stream?device=auto")
@@ -973,6 +1309,9 @@ class PerformanceGUI:
 
                     if not chunk:
                         continue
+
+                    dev = self.devices.get(base_url)
+                    self.append_loop_buffer(source, chunk, dev.speed if dev else 0)
 
                     try:
                         source["queue"].put_nowait(chunk)
@@ -1010,7 +1349,58 @@ class PerformanceGUI:
         if len(raw) < wanted_bytes:
             raw += b"\x00" * (wanted_bytes - len(raw))
 
+        with source["lock"]:
+            source["playout_bytes"] = source.get("playout_bytes", 0) + wanted_bytes
+
         return self.pcm_samples(raw)
+
+    def buffered_loop_samples(self, source, frames, dev):
+        with source["lock"]:
+            loop_buffer = source.get("loop_buffer", bytearray())
+
+            if not loop_buffer:
+                source["kind"] = "empty"
+                return array.array("h", [0] * frames)
+
+            speed_ratio = self.buffer_speed_ratio(source, dev)
+            source["buffer_rate"] = speed_ratio
+
+            if speed_ratio <= 0.0:
+                source["kind"] = "stopped"
+                return array.array("h", [0] * frames)
+
+            loop_bytes = self.detected_loop_bytes(source, len(loop_buffer))
+
+            if loop_bytes <= 0:
+                source["kind"] = "empty"
+                return array.array("h", [0] * frames)
+
+            loop = bytes(loop_buffer[-loop_bytes:])
+            input_bytes = source.get("input_bytes", 0)
+            loop_start_bytes = input_bytes - loop_bytes
+            playout_bytes = source.get("playout_bytes", 0)
+            loop_samples = self.pcm_samples(loop)
+
+            if not loop_samples:
+                source["kind"] = "empty"
+                return array.array("h", [0] * frames)
+
+            playhead_frames = ((playout_bytes - loop_start_bytes) / 2.0) % len(loop_samples)
+            output = array.array("h")
+
+            for _index in range(frames):
+                index_a = int(playhead_frames) % len(loop_samples)
+                index_b = (index_a + 1) % len(loop_samples)
+                fraction = playhead_frames - int(playhead_frames)
+                sample = loop_samples[index_a] * (1.0 - fraction) + loop_samples[index_b] * fraction
+                output.append(int(clamp(sample, -32768, 32767)))
+                playhead_frames = (playhead_frames + speed_ratio) % len(loop_samples)
+
+            source["playout_bytes"] = playout_bytes + frames * 2 * speed_ratio
+            source["buffer_playhead"] = int(playhead_frames * 2)
+            source["kind"] = f"buffer {speed_ratio:.2f}x"
+
+        return output
 
     def _mixer_worker(self, cmd):
         try:
@@ -1038,10 +1428,22 @@ class PerformanceGUI:
                 mixed = [0] * frames
 
                 for source in sources:
-                    samples = self.source_samples(source, frames)
+                    dev = self.devices.get(source["url"])
+
+                    if not dev or not dev.online:
+                        source["level"] = 0.0
+                        source["kind"] = "offline"
+                        continue
+
+                    if dev.mode == "play":
+                        samples = self.source_samples(source, frames)
+                        source["kind"] = "live"
+                    else:
+                        samples = self.buffered_loop_samples(source, frames, dev)
+
+                    self.maybe_analyze_loop(source, dev)
                     level = self.pcm_level(samples)
                     source["level"] = level
-                    dev = self.devices.get(source["url"])
                     volume = dev.monitor_volume if dev else 1.0
                     muted = dev.monitor_muted if dev else False
 
