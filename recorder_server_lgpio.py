@@ -651,6 +651,11 @@ def local_monitor_worker(capture_cmd, playback_cmd, stop_event):
             bufsize=0,
         )
 
+        with local_monitor_lock:
+            if local_monitor is not None:
+                local_monitor["capture_proc"] = capture_proc
+                local_monitor["playback_proc"] = playback_proc
+
         debug(
             "Local audio monitor started "
             f"capture_pid={capture_proc.pid} playback_pid={playback_proc.pid}"
@@ -782,6 +787,8 @@ def start_local_monitor(input_device=None, output_device=None, rate=None, channe
         local_monitor = {
             "thread": thread,
             "stop_event": stop_event,
+            "capture_proc": None,
+            "playback_proc": None,
         }
         state["local_monitor"].update({
             "running": True,
@@ -796,7 +803,7 @@ def start_local_monitor(input_device=None, output_device=None, rate=None, channe
         return dict(state["local_monitor"])
 
 
-def stop_local_monitor():
+def stop_local_monitor(wait=False):
     global local_monitor
 
     with local_monitor_lock:
@@ -806,6 +813,15 @@ def stop_local_monitor():
 
     if monitor:
         monitor["stop_event"].set()
+
+        for proc_name in ["capture_proc", "playback_proc"]:
+            proc = monitor.get(proc_name)
+
+            if proc and proc.poll() is None:
+                proc.terminate()
+
+        if wait and monitor["thread"].is_alive():
+            monitor["thread"].join(timeout=1.0)
 
     return dict(state["local_monitor"])
 
@@ -950,6 +966,8 @@ def set_record(mute_amp=True, connect_mic=True, record_led=True):
         f"Set mode: RECORD mute_amp={mute_amp} "
         f"connect_mic={connect_mic} record_led={record_led}"
     )
+
+    stop_local_monitor(wait=True)
 
     if not state["recorder_enabled"]:
         set_recorder_power(True)
@@ -1316,6 +1334,8 @@ def route_audio_playback():
             "ok": False,
             "error": "aplay not found. Install alsa-utils on the Raspberry Pi.",
         }), 500
+
+    stop_local_monitor(wait=True)
 
     try:
         device = choose_alsa_playback_device(request.args.get("device", AUDIO_DEVICE))
