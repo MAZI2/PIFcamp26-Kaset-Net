@@ -235,7 +235,18 @@ def start_record_led_blink():
 
 
 def stop_record_led_blink():
+    global record_led_thread
+
     record_led_stop_event.set()
+
+    if (
+        record_led_thread
+        and record_led_thread.is_alive()
+        and threading.current_thread() is not record_led_thread
+    ):
+        record_led_thread.join(timeout=0.2)
+
+    record_led_thread = None
     state["record_led_blinking"] = False
     set_record_led(False)
 
@@ -1222,8 +1233,7 @@ def route_debug_mic_record():
 @app.route("/debug/record-led/on", methods=["GET", "POST"])
 def route_debug_record_led_on():
     debug("HTTP /debug/record-led/on")
-    record_led_stop_event.set()
-    state["record_led_blinking"] = False
+    stop_record_led_blink()
     set_record_led(True)
     apply_motor()
     return jsonify(state)
