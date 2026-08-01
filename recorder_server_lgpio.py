@@ -5,6 +5,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
 
 from flask import Flask, Response, jsonify, request, stream_with_context
@@ -29,7 +30,7 @@ RECORDER_EN = 23   # whole-recorder enable pin; HIGH = enabled by default
 
 AMP_ON = 17        # HIGH = amp on, LOW = muted
 MIC_SW = 27        # LOW = mic connected, HIGH = mic disconnected
-CD4053_PWR = 22    # Direct CD4053 VDD power: output HIGH = powered, input/high-Z = off
+RECORD_LED = 22    # HIGH = LED on; blinks while in record mode
 
 ERASE_IN1 = 5      # DRV8833 erase channel IN1
 ERASE_IN2 = 6      # DRV8833 erase channel IN2
@@ -82,6 +83,8 @@ h = None
 zeroconf = None
 service_info = None
 motor_output_reverse = None
+record_led_thread = None
+record_led_stop_event = threading.Event()
 
 state = {
     "recorder_enabled": False,
@@ -91,7 +94,8 @@ state = {
     "motor_speed": 0,          # 0–255
     "motor_reverse": False,
     "motor_pwm_freq_hz": DEFAULT_MOTOR_PWM_FREQ_HZ,
-    "cd4053_powered": False,
+    "record_led": False,
+    "record_led_blinking": False,
 }
 
 
@@ -137,31 +141,6 @@ def enable_level(on: bool) -> int:
     if RECORDER_ENABLE_ACTIVE_HIGH:
         return 1 if on else 0
     return 0 if on else 1
-
-
-def cd4053_power(on: bool):
-    state["cd4053_powered"] = bool(on)
-
-    if on:
-        lgpio.gpio_claim_output(h, CD4053_PWR, 1)
-    else:
-        release_cd4053_power()
-
-
-def release_cd4053_power():
-    try:
-        pull_none = getattr(lgpio, "SET_PULL_NONE", 0)
-        lgpio.gpio_claim_input(h, CD4053_PWR, pull_none)
-    except TypeError:
-        lgpio.gpio_claim_input(h, CD4053_PWR)
-
-    gpio_free = getattr(lgpio, "gpio_free", None)
-
-    if gpio_free:
-        try:
-            gpio_free(h, CD4053_PWR)
-        except Exception as e:
-            debug(f"GPIO {CD4053_PWR} free ignored: {e}")
 
 
 def open_gpiochip():
@@ -220,11 +199,53 @@ def start_pwm(pin: int, freq_hz, duty_percent, offset_us=0):
     )
 
 
+def set_record_led(on: bool):
+    state["record_led"] = bool(on)
+    write(RECORD_LED, 1 if on else 0)
+
+
+def record_led_blink_worker(stop_event):
+    while not stop_event.is_set():
+        set_record_led(True)
+
+        if stop_event.wait(1.0):
+            break
+
+        set_record_led(False)
+        stop_event.wait(1.0)
+
+    set_record_led(False)
+
+
+def start_record_led_blink():
+    global record_led_thread, record_led_stop_event
+
+    if record_led_thread and record_led_thread.is_alive():
+        return
+
+    record_led_stop_event = threading.Event()
+    state["record_led_blinking"] = True
+    record_led_thread = threading.Thread(
+        target=record_led_blink_worker,
+        args=(record_led_stop_event,),
+        daemon=True,
+    )
+    record_led_thread.start()
+    debug(f"Record LED blinking on GPIO {RECORD_LED}")
+
+
+def stop_record_led_blink():
+    record_led_stop_event.set()
+    state["record_led_blinking"] = False
+    set_record_led(False)
+
+
 def claim_outputs():
     pins = [
         (RECORDER_EN, enable_level(False)),
         (AMP_ON, 0),
         (MIC_SW, 1),
+        (RECORD_LED, 0),
         (ERASE_IN1, 0),
         (ERASE_IN2, 0),
         (MOTOR_IN3, 0),
@@ -234,9 +255,6 @@ def claim_outputs():
     for pin, initial_level in pins:
         lgpio.gpio_claim_output(h, pin, initial_level)
         debug(f"Claimed GPIO {pin} as output, initial={initial_level}")
-
-    cd4053_power(False)
-    debug(f"Claimed GPIO {CD4053_PWR} as input/high-Z")
 
 
 # ============================================================
@@ -655,7 +673,7 @@ def set_recorder_power(on: bool):
         apply_motor()
         write(AMP_ON, 0)
         write(MIC_SW, 1)
-        cd4053_power(False)
+        stop_record_led_blink()
 
 
 def ensure_motor_for_record():
@@ -677,7 +695,9 @@ def set_record(mute_amp=True, connect_mic=True, record_led=True):
     state["mode"] = "record"
 
     if record_led:
-        debug("Record step: LED request ignored; GPIO 22 powers CD4053")
+        start_record_led_blink()
+    else:
+        stop_record_led_blink()
 
     if mute_amp:
         debug("Record step: amp muted")
@@ -687,9 +707,6 @@ def set_record(mute_amp=True, connect_mic=True, record_led=True):
         debug("Record step: amp left unchanged")
 
     if connect_mic:
-        debug("Record step: CD4053 powered")
-        cd4053_power(True)
-        time.sleep(0.05)
         debug("Record step: mic/record path connected")
         write(MIC_SW, 0)
         time.sleep(0.05)
@@ -712,13 +729,10 @@ def set_play():
         time.sleep(0.2)
 
     state["mode"] = "play"
+    stop_record_led_blink()
 
     write(AMP_ON, 0)
-    cd4053_power(True)
-    time.sleep(0.05)
     write(MIC_SW, 1)
-    time.sleep(0.05)
-    cd4053_power(False)
     time.sleep(0.05)
 
     update_amp_mute()
@@ -815,7 +829,7 @@ def setup():
 
     write(AMP_ON, 0)
     write(MIC_SW, 1)
-    cd4053_power(False)
+    stop_record_led_blink()
 
     stop_waveform(MOTOR_IN3)
     stop_waveform(MOTOR_IN4)
@@ -844,7 +858,7 @@ def cleanup():
     try:
         write(AMP_ON, 0)
         write(MIC_SW, 1)
-        cd4053_power(False)
+        stop_record_led_blink()
         write(RECORDER_EN, enable_level(False))
     except Exception:
         pass
@@ -908,8 +922,8 @@ def index():
     <p><a href="/debug/amp/off">Debug amp OFF</a></p>
     <p><a href="/debug/mic/play">Debug mic PLAY path</a></p>
     <p><a href="/debug/mic/record">Debug mic RECORD path</a></p>
-    <p><a href="/debug/cd4053/on">Debug CD4053 power ON</a></p>
-    <p><a href="/debug/cd4053/off">Debug CD4053 power OFF</a></p>
+    <p><a href="/debug/record-led/on">Debug record LED ON</a></p>
+    <p><a href="/debug/record-led/off">Debug record LED OFF</a></p>
     """
 
 
@@ -1205,18 +1219,20 @@ def route_debug_mic_record():
     return jsonify(state)
 
 
-@app.route("/debug/cd4053/on", methods=["GET", "POST"])
-def route_debug_cd4053_on():
-    debug("HTTP /debug/cd4053/on")
-    cd4053_power(True)
+@app.route("/debug/record-led/on", methods=["GET", "POST"])
+def route_debug_record_led_on():
+    debug("HTTP /debug/record-led/on")
+    record_led_stop_event.set()
+    state["record_led_blinking"] = False
+    set_record_led(True)
     apply_motor()
     return jsonify(state)
 
 
-@app.route("/debug/cd4053/off", methods=["GET", "POST"])
-def route_debug_cd4053_off():
-    debug("HTTP /debug/cd4053/off")
-    cd4053_power(False)
+@app.route("/debug/record-led/off", methods=["GET", "POST"])
+def route_debug_record_led_off():
+    debug("HTTP /debug/record-led/off")
+    stop_record_led_blink()
     apply_motor()
     return jsonify(state)
 
