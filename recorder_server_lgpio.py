@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import atexit
+import array
 import re
 import shutil
 import socket
@@ -85,6 +86,8 @@ service_info = None
 motor_output_reverse = None
 record_led_thread = None
 record_led_stop_event = threading.Event()
+local_monitor = None
+local_monitor_lock = threading.Lock()
 
 state = {
     "recorder_enabled": False,
@@ -96,6 +99,17 @@ state = {
     "motor_pwm_freq_hz": DEFAULT_MOTOR_PWM_FREQ_HZ,
     "record_led": False,
     "record_led_blinking": False,
+    "local_monitor": {
+        "running": False,
+        "input_device": AUDIO_DEVICE,
+        "output_device": "default",
+        "rate": AUDIO_RATE,
+        "channels": AUDIO_CHANNELS,
+        "volume": 1.0,
+        "muted": False,
+        "level": 0.0,
+        "bytes": 0,
+    },
 }
 
 
@@ -558,6 +572,244 @@ def record_audio_wav_with_arecord(seconds, samplerate, channels, device=None):
     return result.stdout
 
 
+def pcm_samples(chunk):
+    if not chunk:
+        return array.array("h")
+
+    if len(chunk) % 2:
+        chunk = chunk[:-1]
+
+    samples = array.array("h")
+    samples.frombytes(chunk)
+    return samples
+
+
+def pcm_level(chunk):
+    samples = pcm_samples(chunk)
+
+    if not samples:
+        return 0.0
+
+    square_sum = sum(sample * sample for sample in samples)
+    rms = (square_sum / len(samples)) ** 0.5
+    return min(1.0, rms / 12000.0)
+
+
+def apply_pcm_volume(chunk, volume, muted=False):
+    if muted:
+        return b"\x00" * len(chunk)
+
+    volume = float(clamp(float(volume), 0.0, 4.0))
+
+    if abs(volume - 1.0) < 0.001:
+        return chunk
+
+    samples = pcm_samples(chunk)
+
+    for index, sample in enumerate(samples):
+        samples[index] = int(clamp(sample * volume, -32768, 32767))
+
+    return samples.tobytes()
+
+
+def choose_local_monitor_output_device(device=None):
+    if device and device not in ["auto"]:
+        return device
+
+    return "default"
+
+
+def set_local_monitor_volume(volume=None, muted=None):
+    with local_monitor_lock:
+        monitor_state = state["local_monitor"]
+
+        if volume is not None:
+            monitor_state["volume"] = float(clamp(float(volume), 0.0, 4.0))
+
+        if muted is not None:
+            monitor_state["muted"] = bool(muted)
+
+        return dict(monitor_state)
+
+
+def local_monitor_worker(capture_cmd, playback_cmd, stop_event):
+    capture_proc = None
+    playback_proc = None
+    total_bytes = 0
+
+    try:
+        capture_proc = subprocess.Popen(
+            capture_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        playback_proc = subprocess.Popen(
+            playback_cmd,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+
+        debug(
+            "Local audio monitor started "
+            f"capture_pid={capture_proc.pid} playback_pid={playback_proc.pid}"
+        )
+
+        while not stop_event.is_set():
+            chunk = capture_proc.stdout.read(4096)
+
+            if not chunk:
+                break
+
+            with local_monitor_lock:
+                monitor_state = state["local_monitor"]
+                volume = monitor_state["volume"]
+                muted = monitor_state["muted"]
+
+            output_chunk = apply_pcm_volume(chunk, volume, muted)
+            playback_proc.stdin.write(output_chunk)
+            total_bytes += len(output_chunk)
+
+            with local_monitor_lock:
+                state["local_monitor"]["level"] = 0.0 if muted else pcm_level(output_chunk)
+                state["local_monitor"]["bytes"] = total_bytes
+
+    except BrokenPipeError:
+        debug("Local audio monitor playback pipe closed")
+
+    except Exception as e:
+        debug(f"Local audio monitor error: {type(e).__name__}: {e}")
+
+    finally:
+        for proc, stream_name in [
+            (capture_proc, "capture"),
+            (playback_proc, "playback"),
+        ]:
+            if proc is None:
+                continue
+
+            try:
+                if stream_name == "playback" and proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
+
+            if proc.poll() is None:
+                proc.terminate()
+
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+        with local_monitor_lock:
+            state["local_monitor"]["running"] = False
+            state["local_monitor"]["level"] = 0.0
+            state["local_monitor"]["bytes"] = total_bytes
+
+        debug(f"Local audio monitor stopped, bytes={total_bytes}")
+
+
+def start_local_monitor(input_device=None, output_device=None, rate=None, channels=None):
+    global local_monitor
+
+    if not find_arecord():
+        raise RuntimeError("arecord not found. Install alsa-utils on the Raspberry Pi.")
+
+    if not find_aplay():
+        raise RuntimeError("aplay not found. Install alsa-utils on the Raspberry Pi.")
+
+    input_device = choose_alsa_capture_device(input_device or AUDIO_DEVICE)
+    output_device = choose_local_monitor_output_device(output_device or "default")
+    rate = int(clamp(int(rate or AUDIO_RATE), 8000, 96000))
+    channels = int(clamp(int(channels or AUDIO_CHANNELS), 1, 2))
+    old_monitor = None
+
+    with local_monitor_lock:
+        existing = local_monitor
+
+        if existing and existing["thread"].is_alive():
+            monitor_state = state["local_monitor"]
+            same_route = (
+                monitor_state["input_device"] == input_device
+                and monitor_state["output_device"] == output_device
+                and monitor_state["rate"] == rate
+                and monitor_state["channels"] == channels
+            )
+
+            if same_route:
+                monitor_state["running"] = True
+                return dict(monitor_state)
+
+            old_monitor = existing
+
+    if old_monitor:
+        old_monitor["stop_event"].set()
+        old_monitor["thread"].join(timeout=0.5)
+
+    with local_monitor_lock:
+        existing = local_monitor
+
+        if existing and existing["thread"].is_alive():
+            state["local_monitor"]["running"] = True
+            return dict(state["local_monitor"])
+
+        stop_event = threading.Event()
+        capture_cmd = [
+            "arecord",
+            "-q",
+            "-D", input_device,
+            "-f", AUDIO_FORMAT,
+            "-r", str(rate),
+            "-c", str(channels),
+            "-t", "raw",
+        ]
+        playback_cmd = [
+            "aplay",
+            "-q",
+            "-D", output_device,
+            "-f", AUDIO_FORMAT,
+            "-r", str(rate),
+            "-c", str(channels),
+            "-t", "raw",
+        ]
+        thread = threading.Thread(
+            target=local_monitor_worker,
+            args=(capture_cmd, playback_cmd, stop_event),
+            daemon=True,
+        )
+        local_monitor = {
+            "thread": thread,
+            "stop_event": stop_event,
+        }
+        state["local_monitor"].update({
+            "running": True,
+            "input_device": input_device,
+            "output_device": output_device,
+            "rate": rate,
+            "channels": channels,
+            "level": 0.0,
+            "bytes": 0,
+        })
+        thread.start()
+        return dict(state["local_monitor"])
+
+
+def stop_local_monitor():
+    global local_monitor
+
+    with local_monitor_lock:
+        monitor = local_monitor
+        state["local_monitor"]["running"] = False
+        state["local_monitor"]["level"] = 0.0
+
+    if monitor:
+        monitor["stop_event"].set()
+
+    return dict(state["local_monitor"])
+
+
 # ============================================================
 # mDNS / ZEROCONF ADVERTISEMENT
 # ============================================================
@@ -861,6 +1113,11 @@ def cleanup():
         pass
 
     try:
+        stop_local_monitor()
+    except Exception:
+        pass
+
+    try:
         state["motor_speed"] = 0
         apply_motor()
     except Exception:
@@ -935,6 +1192,9 @@ def index():
     <p><a href="/debug/mic/record">Debug mic RECORD path</a></p>
     <p><a href="/debug/record-led/on">Debug record LED ON</a></p>
     <p><a href="/debug/record-led/off">Debug record LED OFF</a></p>
+    <p><a href="/audio/local-monitor/start">Audio local monitor START</a></p>
+    <p><a href="/audio/local-monitor/stop">Audio local monitor STOP</a></p>
+    <p><a href="/audio/local-monitor/status">Audio local monitor STATUS</a></p>
     """
 
 
@@ -1158,6 +1418,78 @@ def route_audio_playback():
         "rate": rate,
         "channels": channels,
         "bytes": total_bytes,
+    })
+
+
+@app.route("/audio/local-monitor/start", methods=["GET", "POST"])
+def route_audio_local_monitor_start():
+    debug("HTTP /audio/local-monitor/start")
+
+    try:
+        volume = request.values.get("volume")
+        muted = request.values.get("mute")
+
+        set_local_monitor_volume(
+            volume=volume if volume is not None else None,
+            muted=parse_bool(muted, False) if muted is not None else None,
+        )
+        monitor_state = start_local_monitor(
+            input_device=request.values.get("input", request.values.get("device", AUDIO_DEVICE)),
+            output_device=request.values.get("output", "default"),
+            rate=request.values.get("rate", AUDIO_RATE),
+            channels=request.values.get("channels", AUDIO_CHANNELS),
+        )
+        return jsonify({
+            "ok": True,
+            "local_monitor": monitor_state,
+            **state,
+        })
+
+    except Exception as e:
+        debug(f"Local monitor start error: {type(e).__name__}: {e}")
+        return jsonify({"ok": False, "error": str(e), **state}), 500
+
+
+@app.route("/audio/local-monitor/stop", methods=["GET", "POST"])
+def route_audio_local_monitor_stop():
+    debug("HTTP /audio/local-monitor/stop")
+    monitor_state = stop_local_monitor()
+    return jsonify({
+        "ok": True,
+        "local_monitor": monitor_state,
+        **state,
+    })
+
+
+@app.route("/audio/local-monitor/volume", methods=["GET", "POST"])
+def route_audio_local_monitor_volume():
+    debug("HTTP /audio/local-monitor/volume")
+
+    volume = request.values.get("volume")
+    muted = request.values.get("mute")
+    monitor_state = set_local_monitor_volume(
+        volume=volume if volume is not None else None,
+        muted=parse_bool(muted, False) if muted is not None else None,
+    )
+
+    return jsonify({
+        "ok": True,
+        "local_monitor": monitor_state,
+        **state,
+    })
+
+
+@app.route("/audio/local-monitor/status", methods=["GET"])
+def route_audio_local_monitor_status():
+    debug("HTTP /audio/local-monitor/status")
+
+    with local_monitor_lock:
+        monitor_state = dict(state["local_monitor"])
+
+    return jsonify({
+        "ok": True,
+        "local_monitor": monitor_state,
+        **state,
     })
 
 
