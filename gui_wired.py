@@ -476,7 +476,8 @@ class PerformanceGUI:
         self.audio_send_source = tk.StringVar(value="0" if sys.platform == "darwin" else "default")
         self.audio_send_status = tk.StringVar(value="Send idle")
         self.audio_send_gain = tk.DoubleVar(value=2.0)
-        self.audio_output_device = tk.StringVar(value="default")
+        self.audio_output_device = tk.StringVar(value="auto")
+        self.local_monitor_output_device = tk.StringVar(value="default")
         self.manual_host = tk.StringVar(value="192.168.0.9")
 
         self.zeroconf = None
@@ -1013,7 +1014,7 @@ class PerformanceGUI:
                 self.stop_wired_monitor(dev)
 
     def local_monitor_query(self, dev):
-        output_device = quote(self.audio_output_device.get().strip() or "default", safe="")
+        output_device = quote(self.local_monitor_output_device.get().strip() or "default", safe="")
         mute = "1" if dev.monitor_muted else "0"
         return (
             f"volume={dev.monitor_volume:.3f}&mute={mute}"
